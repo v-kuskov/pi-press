@@ -4,7 +4,7 @@
 
 **Blocked by:** 04 — Context Hook — Caching + Warning
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] forced compaction triggers when tokens >= forceTokens
 - [ ] only triggers when last message is assistant text (not tool call)

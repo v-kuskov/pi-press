@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 — Skeleton + Config
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] buildSnapshot splits messages by keep parameter, truncates tool results to 200 chars
 - [ ] compactContext calls LLM with config model (fallback to session model)

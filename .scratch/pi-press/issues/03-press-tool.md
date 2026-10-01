@@ -4,7 +4,7 @@
 
 **Blocked by:** 02 — Compaction Engine
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] press tool registered via pi.registerTool with TypeBox parameters
 - [ ] tool accepts note (optional string) and keep (optional integer, default 1)

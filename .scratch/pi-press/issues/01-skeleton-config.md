@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] package.json declares pi extension entry point and peer deps
 - [ ] tsconfig.json compiles without errors

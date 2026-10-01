@@ -4,7 +4,7 @@
 
 **Blocked by:** 02 — Compaction Engine
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] context event caches event.messages in closure variable
 - [ ] token check only fires when last message is assistant text message
