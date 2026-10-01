@@ -1,9 +1,9 @@
 import { Type } from "typebox";
 import type { Static } from "typebox";
 import type { AgentToolResult, ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
-import { compactContext, NO_MESSAGES_NOTE, PressError } from "./compact.ts";
+import { compactContext, failureText, NO_MESSAGES_NOTE } from "./compact.ts";
 import { readPressSettings } from "./config.ts";
-import { cachedMessagesSnapshot, stageCompactedContext } from "./state.ts";
+import type { PressState } from "./state.ts";
 
 /** The `press` tool's parameters. */
 const parameters = Type.Object({
@@ -41,20 +41,19 @@ export type PressDetails = {
  *
  * The tool result is all the model sees on this turn. Replacing the conversation itself is
  * the context hook's job (it is the only place with the message array), so the executor also
- * stages `[summary, ...kept]` in the shared state module for the next `context` pass to
+ * stages `[summary, ...kept]` in the registration's state for the next `context` pass to
  * install in place of the array. Until that hook exists the staging is inert, which is why
  * the tool result carries the summary text in full.
+ *
+ * `state` is the registration's own cache, so a second loaded session cannot compact this
+ * one's conversation.
  */
-export function registerPressTool(pi: ExtensionAPI): void {
+export function registerPressTool(pi: ExtensionAPI, state: PressState): void {
 	pi.registerTool({
 		name: "press",
 		label: "Compact context",
 		description:
-			"Compact the conversation so far into a summary, keeping the most recent messages verbatim. Call it when the context is getting full and you want to keep working on the same task. Pass a note describing what matters most to preserve.",
-		promptSnippet: "Compact the conversation when its context is filling up",
-		promptGuidelines: [
-			"When the context is getting full, call press instead of asking the user to start over. Pass note with what matters most to preserve, and raise keep when you are mid-way through a multi-step task.",
-		],
+			"Compact the conversation so far into a summary, keeping the most recent messages verbatim. Call it when the context is getting full and you want to keep working on the same task, instead of asking the user to start over. Pass note describing what matters most to preserve, and raise keep when you are mid-way through a multi-step task.",
 		parameters,
 		// Compaction rewrites the conversation, so it must not overlap with other tool calls.
 		executionMode: "sequential",
@@ -65,7 +64,7 @@ export function registerPressTool(pi: ExtensionAPI): void {
 			_onUpdate,
 			ctx: ExtensionToolContext,
 		): Promise<AgentToolResult<PressDetails>> {
-			const messages = cachedMessagesSnapshot();
+			const messages = state.cachedMessages();
 			if (messages.length === 0) {
 				return errorResult(NO_MESSAGES_NOTE);
 			}
@@ -92,7 +91,10 @@ export function registerPressTool(pi: ExtensionAPI): void {
 			}
 
 			// Stage the replacement context for the next context pass; see this function's doc.
-			stageCompactedContext([result.message, ...result.kept]);
+			// The base is the array this call compacted, not a re-read of the cache: a context
+			// pass during the model call above would have replaced the cache with a conversation
+			// this summary never saw, and comparing against that would drop the compaction.
+			state.stageCompacted([result.message, ...result.kept], messages);
 
 			// The engine always fills this single block; the fallback only satisfies the checker.
 			const text = result.message.content[0]?.text ?? "";
@@ -115,17 +117,4 @@ function errorResult(text: string): AgentToolResult<PressDetails> {
 		details: { status: "error", compacted: 0, kept: 0 },
 		isError: true,
 	};
-}
-
-/**
- * The failure text the model reads.
- *
- * The engine's `hint` is the corrective instruction written for exactly this reader, so it
- * follows the failure rather than being dropped; an unexpected throw has no hint.
- */
-function failureText(error: unknown): string {
-	if (error instanceof PressError) {
-		return error.hint === undefined ? error.message : `${error.message}\n\n${error.hint}`;
-	}
-	return `Compaction failed: ${error instanceof Error ? error.message : String(error)}`;
 }

@@ -55,8 +55,6 @@ export type Compacted = {
 	kind: "compacted";
 	/** The replacement message; the kept messages follow it in the rebuilt context. */
 	message: SummaryMessage;
-	/** The parsed sections, for the caller's `details`. */
-	summary: PressSummary;
 	/** Messages preserved verbatim. */
 	kept: ConversationMessage[];
 	/** How many messages `message` replaced. */
@@ -100,30 +98,18 @@ export type CompactionContext = {
  * A compaction failure the caller reports to the model as `isError: true`.
  *
  * Carries the provider's own words when the failure was a model call, so the model is told
- * the real reason rather than a generic one.
+ * the real reason rather than a generic one. The wording itself is built at the throw site and
+ * travels in `message`; the class holds only the corrective `hint` that {@link failureText}
+ * appends for the reader.
  */
 export class PressError extends Error {
 	/** A corrective instruction for the model, when there is an obvious one. */
 	readonly hint: string | undefined;
-	/** The response's `stopReason`, present only when a model call failed. */
-	readonly stopReason: string | undefined;
-	/** The provider's error text, present only when the provider reported one. */
-	readonly providerMessage: string | undefined;
 
-	constructor(
-		message: string,
-		options: {
-			hint?: string;
-			stopReason?: string;
-			providerMessage?: string;
-			cause?: unknown;
-		} = {},
-	) {
+	constructor(message: string, options: { hint?: string; cause?: unknown } = {}) {
 		super(message, options.cause === undefined ? undefined : { cause: options.cause });
 		this.name = "PressError";
 		this.hint = options.hint;
-		this.stopReason = options.stopReason;
-		this.providerMessage = options.providerMessage;
 	}
 }
 
@@ -184,10 +170,9 @@ export async function compactContext(
 		kind: "compacted",
 		message: {
 			role: "assistant",
-			content: [{ type: "text", text: renderPressSummary(summary) }],
+			content: [{ type: "text", text: appendNote(renderPressSummary(summary), note) }],
 			timestamp: Date.now(),
 		},
-		summary,
 		kept: snapshot.kept,
 		compacted: snapshot.compacted,
 	};
@@ -218,7 +203,6 @@ async function requestSummary(
 	if (response.stopReason === "error") {
 		throw new PressError(
 			`Compaction failed: ${response.errorMessage ?? "the model returned an error"}`,
-			{ stopReason: response.stopReason, providerMessage: response.errorMessage },
 		);
 	}
 
@@ -228,7 +212,6 @@ async function requestSummary(
 		// is what tells the caller whether retrying is worth anything.
 		throw new PressError(
 			`Compaction failed: the model returned no text (stop reason: ${response.stopReason ?? "unknown"})`,
-			{ stopReason: response.stopReason },
 		);
 	}
 	return text;
@@ -356,7 +339,7 @@ const SECTION_HEADING = /^#{0,4}\s*(summary|files|notes)\s*:?\s*$/i;
  * case-insensitively and at any depth, because models vary in how they punctuate them.
  */
 export function parsePressSummary(raw: string): PressSummary {
-	const block = pressSummaryBlock(raw);
+	const block = pressSummaryBody(raw);
 	const { preamble, sections } = splitSections(block);
 	return {
 		// A model that opened with prose before its first heading put the summary there.
@@ -367,7 +350,7 @@ export function parsePressSummary(raw: string): PressSummary {
 }
 
 /** The inside of the `<press-summary>` block, or the whole answer when there is no block. */
-function pressSummaryBlock(raw: string): string {
+function pressSummaryBody(raw: string): string {
 	const closed = /<press-summary>([\s\S]*?)<\/press-summary>/i.exec(raw);
 	if (closed?.[1] !== undefined) return closed[1].trim();
 
@@ -423,6 +406,38 @@ export function renderPressSummary({ summary, files, notes }: PressSummary): str
 	if (files) parts.push(`## Files\n${files}`);
 	if (notes) parts.push(`## Notes\n${notes}`);
 	return `<press-summary>\n${parts.join("\n\n")}\n</press-summary>`;
+}
+
+/**
+ * The summary block with the caller's note appended after it.
+ *
+ * The note is appended here, not left for the compaction model to echo into its Notes section.
+ * The one line explaining why the conversation is suddenly short is exactly the line a summary
+ * must not lose, and a model that paraphrases or drops it would lose it silently - so the note
+ * is added to the message outside the model's control, and `renderPressSummary` stays the pure
+ * renderer of what the model produced.
+ *
+ * The note still reaches the prompt as well: there it tells the model what to preserve, and
+ * here it tells the next turn what happened.
+ */
+function appendNote(block: string, note: string | undefined): string {
+	const trimmed = note?.trim();
+	return trimmed ? `${block}\n\n${trimmed}` : block;
+}
+
+/**
+ * How a failure is worded for the model that has to act on it.
+ *
+ * One place, because two callers report the same failures: the `press` tool returns the text as
+ * its result, and the context hook embeds it in the note it appends to the conversation. Both
+ * readers need the engine's `hint` - the corrective instruction written for exactly this reader -
+ * and an unexpected throw has none.
+ */
+export function failureText(error: unknown): string {
+	if (error instanceof PressError) {
+		return error.hint === undefined ? error.message : `${error.message}\n\n${error.hint}`;
+	}
+	return `Compaction failed: ${reasonOf(error)}`;
 }
 
 /** Clamp a caller-supplied `keep` into `[0, total]`, floor first. */

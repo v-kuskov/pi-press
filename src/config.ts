@@ -48,8 +48,8 @@ export function readPressSettings(cwd: string): PressSettings {
 	}
 
 	// Project scope is read first so a project can pin any subset of the three fields.
-	const project = pick(readScope(settings, "project"));
-	const global = pick(readScope(settings, "global"));
+	const project = normalizePressValue(readScope(settings, "project"));
+	const global = normalizePressValue(readScope(settings, "global"));
 	const model = project.model ?? global.model;
 	return {
 		// Omitted rather than set to undefined, so a caller can test for the key itself.
@@ -80,7 +80,7 @@ function readScope(settings: SettingsManager, scope: "project" | "global"): unkn
 }
 
 /** Normalize one `press` value, ignoring anything unusable and defaulting nothing. */
-function pick(raw: unknown): PartialPressSettings {
+function normalizePressValue(raw: unknown): PartialPressSettings {
 	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
 	const source = raw as Record<string, unknown>;
 	const out: PartialPressSettings = {};
