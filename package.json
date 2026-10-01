@@ -2,7 +2,7 @@
   "name": "pi-press",
   "version": "0.1.0",
   "license": "GPL-3.0-or-later",
-  "description": "Pi Coding Agent extension — a `press` tool that compacts the conversation through an LLM summary, with token-pressure warnings and forced compaction as safety nets.",
+  "description": "Pi Coding Agent extension — the model compacts its own context: `press` summarizes the conversation through an LLM call, `trim` reclaims old tool results for free, and token-pressure warnings nudge the model before the window fills.",
   "keywords": [
     "pi-package",
     "pi-extension",
