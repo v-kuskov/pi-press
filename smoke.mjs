@@ -8,21 +8,25 @@ import {
 	buildSnapshot,
 	compactContext,
 	DEFAULT_KEEP,
+	extractFilePaths,
 	failureText,
+	findAnchor,
 	NO_MESSAGES_NOTE,
 	parsePressSummary,
 	PressError,
 	renderPressSummary,
 	TOOL_RESULT_CHARS,
+	trimMessages,
 } from "./src/compact.ts";
 import {
-	DEFAULT_FORCE_TOKENS,
+	DEFAULT_CRITICAL_TOKENS,
 	DEFAULT_WARN_TOKENS,
 	readPressSettings,
 	SETTINGS_KEY,
 } from "./src/config.ts";
-import { registerContextHook } from "./src/context-hook.ts";
+import { handleContext, registerContextHook } from "./src/context-hook.ts";
 import { registerPressTool } from "./src/press-tool.ts";
+import { registerTrimTool } from "./src/trim-tool.ts";
 import { createPressState } from "./src/state.ts";
 
 /**
@@ -67,10 +71,10 @@ function resetSettings() {
 	rmSync(join(isolatedAgentDir, "settings.json"), { force: true });
 }
 
-const DEFAULTS = { warnTokens: DEFAULT_WARN_TOKENS, forceTokens: DEFAULT_FORCE_TOKENS };
+const DEFAULTS = { warnTokens: DEFAULT_WARN_TOKENS, criticalTokens: DEFAULT_CRITICAL_TOKENS };
 
 // Pressure over the warning threshold but under the hard limit. Warning cases run here,
-// because crossing forceTokens is the one thing that makes the warning not the response.
+// because crossing the critical threshold is the one thing that makes the warning not the response.
 const WARNING_PRESSURE = DEFAULT_WARN_TOKENS + 1000;
 
 // ------------------------------------------------------------------ factory
@@ -91,10 +95,13 @@ await check("the factory registers the press tool and the context hook synchrono
 	assert.deepEqual(handlers, ["context"], "the context hook is the only hook registered");
 	assert.deepEqual(
 		tools.map((tool) => tool.name),
-		["press"],
-		"the press tool is the only tool registered",
+		["press", "trim"],
+		"the press and trim tools are the only tools registered",
 	);
-	assert.equal(typeof tools[0].execute, "function", "the tool is executable");
+	assert.ok(
+		tools.every((tool) => typeof tool.execute === "function"),
+		"both tools are executable",
+	);
 });
 
 await check("each registration gets its own state, so sessions never share a conversation", async () => {
@@ -137,7 +144,7 @@ await check("unconfigured settings fall back to the documented defaults", async 
 	try {
 		assert.deepEqual(readPressSettings(root), DEFAULTS);
 		assert.equal(DEFAULT_WARN_TOKENS, 260000);
-		assert.equal(DEFAULT_FORCE_TOKENS, 500000);
+		assert.equal(DEFAULT_CRITICAL_TOKENS, 500000);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -148,20 +155,20 @@ await check("the press key is read from the object form, project scope winning",
 	const root = tempProject();
 	try {
 		writeScope(root, "global", {
-			[SETTINGS_KEY]: { model: "global/model", warnTokens: 100, forceTokens: 200 },
+			[SETTINGS_KEY]: { model: "global/model", warnTokens: 100, criticalTokens: 200 },
 		});
 		assert.deepEqual(readPressSettings(root), {
 			model: "global/model",
 			warnTokens: 100,
-			forceTokens: 200,
+			criticalTokens: 200,
 		});
 
 		writeScope(root, "project", {
-			[SETTINGS_KEY]: { model: "project/model", warnTokens: 11, forceTokens: 22 },
+			[SETTINGS_KEY]: { model: "project/model", warnTokens: 11, criticalTokens: 22 },
 		});
 		assert.deepEqual(
 			readPressSettings(root),
-			{ model: "project/model", warnTokens: 11, forceTokens: 22 },
+			{ model: "project/model", warnTokens: 11, criticalTokens: 22 },
 			"project wins for every field",
 		);
 	} finally {
@@ -174,14 +181,14 @@ await check("project scope overrides one field without discarding the others", a
 	const root = tempProject();
 	try {
 		writeScope(root, "global", {
-			[SETTINGS_KEY]: { model: "global/model", warnTokens: 100, forceTokens: 200 },
+			[SETTINGS_KEY]: { model: "global/model", warnTokens: 100, criticalTokens: 200 },
 		});
-		// A project that only lowers the force threshold must not lose the global model.
-		writeScope(root, "project", { [SETTINGS_KEY]: { forceTokens: 300 } });
+		// A project that only lowers the critical threshold must not lose the global model.
+		writeScope(root, "project", { [SETTINGS_KEY]: { criticalTokens: 300 } });
 		assert.deepEqual(readPressSettings(root), {
 			model: "global/model",
 			warnTokens: 100,
-			forceTokens: 300,
+			criticalTokens: 300,
 		});
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -196,7 +203,7 @@ await check("unusable field values are ignored in favour of the default", async 
 			[SETTINGS_KEY]: {
 				model: "  spaced/model  ",
 				warnTokens: 0,
-				forceTokens: -5,
+				criticalTokens: -5,
 			},
 		});
 		assert.deepEqual(readPressSettings(root), { model: "spaced/model", ...DEFAULTS });
@@ -205,7 +212,7 @@ await check("unusable field values are ignored in favour of the default", async 
 			writeScope(root, "global", { [SETTINGS_KEY]: junk });
 			const settings = readPressSettings(root);
 			assert.deepEqual(
-				{ warnTokens: settings.warnTokens, forceTokens: settings.forceTokens },
+				{ warnTokens: settings.warnTokens, criticalTokens: settings.criticalTokens },
 				DEFAULTS,
 				`junk ${JSON.stringify(junk)} ignored`,
 			);
@@ -213,9 +220,9 @@ await check("unusable field values are ignored in favour of the default", async 
 		}
 
 		for (const bad of ["100", Number.NaN, Number.POSITIVE_INFINITY, true, null]) {
-			writeScope(root, "global", { [SETTINGS_KEY]: { warnTokens: bad, forceTokens: bad } });
+			writeScope(root, "global", { [SETTINGS_KEY]: { warnTokens: bad, criticalTokens: bad } });
 			assert.deepEqual(
-				{ warnTokens: readPressSettings(root).warnTokens, forceTokens: readPressSettings(root).forceTokens },
+				{ warnTokens: readPressSettings(root).warnTokens, criticalTokens: readPressSettings(root).criticalTokens },
 				DEFAULTS,
 				`threshold ${String(bad)} ignored`,
 			);
@@ -296,7 +303,7 @@ function summaryAnswer({ task = "did the work", state = "", discoveries = "", ne
 }
 
 const OK = { stopReason: "stop", usage: {}, content: summaryAnswer() };
-const SETTINGS = { warnTokens: DEFAULT_WARN_TOKENS, forceTokens: DEFAULT_FORCE_TOKENS };
+const SETTINGS = { warnTokens: DEFAULT_WARN_TOKENS, criticalTokens: DEFAULT_CRITICAL_TOKENS };
 
 await check("buildSnapshot truncates tool results and keeps assistant text whole", async () => {
 	const long = "x".repeat(500);
@@ -386,7 +393,10 @@ await check("compactContext compacts with the configured model and replaces the 
 	assert.equal(calls[0].options.cacheRetention, "none", "a one-shot prompt is not cached");
 
 	const prompt = calls[0].context.messages[0].content[0].text;
-	assert.ok(prompt.includes("keep the migration plan"), "the note reaches the prompt");
+	assert.ok(
+		!prompt.includes("keep the migration plan"),
+		"the note is the caller's, and never enters the prompt",
+	);
 	assert.ok(prompt.includes("### 1. assistant"), "the snapshot reaches the prompt");
 	assert.ok(!prompt.includes("four"), "the kept tail is not part of the snapshot");
 
@@ -623,6 +633,324 @@ await check("a summary split across text blocks is parsed as one answer", async 
 	assert.equal(calls.length, 1);
 });
 
+// ------------------------------------------------- anchor / trim / files
+
+/** An assistant turn holding a real `<press-summary>` block, as a compaction leaves one. */
+function summaryAnchor(text = "first pass") {
+	return assistant(
+		`<press-summary>\n## Task Overview\n${text}\n\n## Context to Preserve\nsrc/compact.ts\n</press-summary>`,
+	);
+}
+
+/** An assistant turn holding a `<press-trim>` note, as the trim tool leaves one. */
+function trimAnchor(text = "12 tool results replaced with [trimmed].") {
+	return assistant(`<press-trim>\n${text}\n</press-trim>`);
+}
+
+await check("findAnchor finds the latest compaction already in the conversation", async () => {
+	assert.equal(findAnchor([]), undefined, "an empty run has no anchor");
+	assert.equal(
+		findAnchor([user("one"), assistant("two")]),
+		undefined,
+		"a conversation never compacted has no anchor",
+	);
+
+	const first = summaryAnchor("first");
+	const second = summaryAnchor("second");
+	const messages = [first, user("new work"), second, assistant("more work")];
+
+	const anchor = findAnchor(messages);
+	assert.equal(anchor.kind, "summary", "the block is read as a summary");
+	assert.equal(anchor.afterIndex, 2, "afterIndex is the anchor message's own index");
+	assert.equal(
+		anchor.text,
+		"## Task Overview\nsecond\n\n## Context to Preserve\nsrc/compact.ts",
+		"text is the inside of the block, and the latest anchor wins",
+	);
+	assert.deepEqual(
+		messages.slice(anchor.afterIndex + 1),
+		[assistant("more work")],
+		"slicing after the index leaves exactly the messages a fresh compaction covers",
+	);
+
+	// A summary truncated by a token limit is still an anchor: the body after the opening tag
+	// is what a later compaction merges into.
+	const truncated = findAnchor([assistant("<press-summary>\n## Task Overview\ncut off")]);
+	assert.equal(truncated.kind, "summary");
+	assert.equal(truncated.text, "## Task Overview\ncut off");
+});
+
+await check("findAnchor rejects tag mentions that are not compactions", async () => {
+	// A note quoting the format, and an assistant turn discussing it, both carry the tag without
+	// being a compaction. The section parser is the arbiter: no recognized heading, no anchor.
+	const quoting = user("remember that <press-summary> wraps the summary block");
+	const discussing = assistant("I emit a <press-summary> block when I compact.");
+	assert.equal(findAnchor([quoting]), undefined, "a user note quoting the tag is not an anchor");
+	assert.equal(findAnchor([discussing]), undefined, "assistant prose about the tag is not an anchor");
+
+	// Non-assistant messages are never anchors, even with a well-formed block in them.
+	const inAToolResult = {
+		role: "toolResult",
+		toolName: "read",
+		content: [
+			{ type: "text", text: "<press-summary>\n## Task Overview\nx\n</press-summary>" },
+		],
+	};
+	assert.equal(
+		findAnchor([inAToolResult]),
+		undefined,
+		"only an assistant message can carry a compaction",
+	);
+
+	// False positive ahead of a real anchor: the scan keeps going backward past it.
+	const real = summaryAnchor("real");
+	const anchor = findAnchor([discussing, real]);
+	assert.equal(anchor.afterIndex, 1, "the scan skips the false positive and finds the real anchor");
+	assert.equal(anchor.text, "## Task Overview\nreal\n\n## Context to Preserve\nsrc/compact.ts");
+});
+
+await check("findAnchor recognizes a trim note, closed or truncated", async () => {
+	const messages = [user("one"), trimAnchor(), assistant("after the trim")];
+	const anchor = findAnchor(messages);
+	assert.equal(anchor.kind, "trim");
+	assert.equal(anchor.afterIndex, 1);
+	assert.equal(anchor.text, "12 tool results replaced with [trimmed].");
+
+	const truncated = findAnchor([assistant("<press-trim>\n20 tool results replaced with [trimmed].")]);
+	assert.equal(truncated.kind, "trim", "an unclosed tail is still a trim anchor");
+	assert.equal(truncated.text, "20 tool results replaced with [trimmed].");
+
+	// The tag alone is not the signal: prose mentioning the format lacks the count line.
+	assert.equal(
+		findAnchor([assistant("keep <press-trim> in mind")]),
+		undefined,
+		"assistant prose mentioning the tag is not a trim anchor",
+	);
+
+	// A trim and a summary in the same run: the later one is the anchor.
+	const both = [trimAnchor(), user("work"), summaryAnchor("after")];
+	assert.equal(findAnchor(both).kind, "summary");
+	assert.equal(findAnchor(both.slice(0, 2)).kind, "trim");
+});
+
+await check("trimMessages replaces tool results without dropping the messages", async () => {
+	const call = assistantToolCall("read");
+	const first = { ...toolResult("read", "the whole file"), toolCallId: "call-1" };
+	const second = { ...toolResult("bash", "a pile of output"), toolCallId: "call-2" };
+	const messages = [call, first, second, assistant("done reading"), user("tail")];
+
+	const result = trimMessages(messages, 1);
+	assert.equal(result.kind, "trimmed");
+	assert.equal(result.trimmed, 2, "both tool results in the compacted run are replaced");
+	assert.equal(result.kept, 1, "the kept tail count is reported");
+	assert.equal(result.messages.length, messages.length, "not one message is dropped");
+	assert.deepEqual(result.messages[0], call, "the tool call that produced the results is untouched");
+
+	// The chain pi replays is the point: identity survives, only the content is replaced.
+	assert.equal(result.messages[1].toolCallId, "call-1", "the result still answers its call");
+	assert.equal(result.messages[1].toolName, "read");
+	assert.equal(result.messages[1].timestamp, first.timestamp);
+	assert.deepEqual(result.messages[1].content, [{ type: "text", text: "[trimmed]" }]);
+	assert.deepEqual(result.messages[2].content, [{ type: "text", text: "[trimmed]" }]);
+	assert.ok(!JSON.stringify(result.messages).includes("the whole file"), "the bulk is gone");
+
+	// Assistant reasoning and the kept tail stay verbatim.
+	assert.deepEqual(result.messages[3], messages[3], "assistant text is not touched by a trim");
+	assert.deepEqual(
+		result.messages[4],
+		messages[4],
+		"the kept tail rides verbatim",
+	);
+	assert.deepEqual(
+		messages[1].content,
+		[{ type: "text", text: "the whole file" }],
+		"the input is not mutated",
+	);
+
+	// keep 0 trims everything there is.
+	assert.equal(trimMessages(messages, 0).trimmed, 2);
+});
+
+await check("trimMessages skips what is already processed or has nothing to trim", async () => {
+	const old = { ...toolResult("read", "old output"), toolCallId: "call-old" };
+	const fresh = { ...toolResult("read", "new output"), toolCallId: "call-new" };
+
+	// The anchor region is already processed: only what follows it is a candidate.
+	const messages = [old, summaryAnchor(), fresh, assistant("end"), user("tail")];
+	const result = trimMessages(messages, 1);
+	assert.equal(result.kind, "trimmed");
+	assert.equal(result.trimmed, 1, "only the result after the anchor is trimmed");
+	assert.deepEqual(
+		result.messages[0].content,
+		[{ type: "text", text: "old output" }],
+		"before the anchor is left alone",
+	);
+	assert.deepEqual(result.messages[2].content, [{ type: "text", text: "[trimmed]" }]);
+
+	// A trim is never applied twice to what a previous trim already replaced.
+	const afterTrim = trimMessages([trimAnchor(), fresh, user("tail")], 1);
+	assert.equal(afterTrim.trimmed, 1, "the fresh result after a trim note is trimmed");
+	const nothingNew = trimMessages([trimAnchor(), assistant("no tools here")], 1);
+	assert.equal(nothingNew.kind, "nothing");
+	assert.match(nothingNew.note, /No tool results to trim/);
+
+	// The same nothing-cases as buildSnapshot, so the tool can word them the same way.
+	const noTools = trimMessages([user("one"), assistant("two")], 1);
+	assert.equal(noTools.kind, "nothing");
+	assert.match(noTools.note, /No tool results to trim/);
+
+	const over = trimMessages([user("one"), assistant("two")], 99);
+	assert.equal(over.kind, "nothing");
+	assert.match(over.note, /already small/i);
+	assert.equal(trimMessages([], 1).note, NO_MESSAGES_NOTE);
+});
+
+await check("extractFilePaths reads the paths the tool calls named", async () => {
+	const messages = [
+		user("go"),
+		{
+			role: "assistant",
+			content: [
+				{ type: "toolCall", name: "read", arguments: { path: "src/compact.ts" } },
+				{ type: "toolCall", name: "edit", arguments: { path: "src/config.ts" } },
+			],
+		},
+		toolResult("read", "contents"),
+		{
+			role: "assistant",
+			content: [
+				{ type: "toolCall", name: "resolve_file", arguments: { pattern: "compact" } },
+				{ type: "toolCall", name: "summary", arguments: { path: "src/state.ts" } },
+				{ type: "toolCall", name: "related_files", arguments: { path: "src/compact.ts" } },
+				{ type: "toolCall", name: "bash", arguments: { command: "ls" } },
+				{ type: "toolCall", name: "write", arguments: {} },
+				{ type: "toolCall", name: "write", arguments: { path: "src/new.ts" } },
+				{ type: "thinking", thinking: "ignored" },
+			],
+		},
+	];
+
+	assert.deepEqual(
+		extractFilePaths(messages),
+		["src/compact.ts", "src/config.ts", "compact", "src/state.ts", "src/new.ts"],
+		"file tools contribute their path or pattern, deduplicated in first-seen order",
+	);
+	assert.deepEqual(extractFilePaths([]), [], "an empty run names no files");
+	assert.deepEqual(
+		extractFilePaths([user("only text"), toolResult("read", "x")]),
+		[],
+		"only assistant tool calls count",
+	);
+});
+
+await check("compactContext merges new messages into the existing summary", async () => {
+	const anchor = summaryAnchor("first pass");
+	const messages = [anchor, user("new question"), assistant("new answer"), user("tail")];
+	const { ctx, calls } = fakeCtx({ respond: () => OK });
+
+	const result = await compactContext(ctx, messages, 1, undefined, SETTINGS);
+	assert.equal(result.kind, "compacted");
+	const prompt = calls[0].context.messages[0].content[0].text;
+
+	assert.ok(prompt.includes("existing summary"), "the prompt frames the answer as a merge");
+	assert.ok(prompt.includes("Merge the new messages into it"), "and says what to do with them");
+	assert.ok(prompt.includes("first pass"), "the model is handed its own earlier summary");
+	assert.ok(prompt.includes("Merge the 2 messages below"), "only the messages after the anchor are counted");
+	assert.ok(prompt.includes("new question"), "the new messages are the snapshot");
+	assert.ok(!prompt.includes("### 0. assistant"), "the anchor itself is not re-summarized");
+	assert.ok(prompt.includes("## Task Overview"), "the output format is unchanged");
+
+	assert.equal(result.compacted, 3, "the replacement still covers the whole compacted run");
+	assert.deepEqual(result.kept, [messages[3]], "and the kept tail is unchanged");
+});
+
+await check("compactContext frames a trim anchor as fresh work, and skips an empty tail", async () => {
+	const trimmed = trimAnchor("40 tool results replaced with [trimmed].");
+	const { ctx, calls } = fakeCtx({ respond: () => OK });
+
+	const messages = [trimmed, user("new question"), assistant("new answer"), user("tail")];
+	const result = await compactContext(ctx, messages, 1, undefined, SETTINGS);
+	assert.equal(result.kind, "compacted");
+	const prompt = calls[0].context.messages[0].content[0].text;
+	assert.ok(prompt.includes("previously trimmed"), "the prompt explains the trimmed history");
+	assert.ok(prompt.includes("Summarize only the new messages"));
+	assert.ok(prompt.includes("40 tool results replaced"), "the trim note travels into the prompt");
+	assert.ok(prompt.includes("new question"));
+
+	// The anchor is the last message of the compacted run: there is nothing left to summarize.
+	const nothing = await compactContext(ctx, [trimmed, user("tail")], 1, undefined, SETTINGS);
+	assert.equal(nothing.kind, "skipped");
+	assert.match(nothing.note, /nothing new to summarize/i);
+	assert.equal(calls.length, 1, "a skipped continuation spends no model call");
+
+	// A note is still appended, never prompted, on the anchored path too.
+	const noted = await compactContext(ctx, messages, 1, "a fresh note", SETTINGS);
+	assert.ok(noted.message.content[0].text.endsWith("a fresh note"));
+	assert.ok(!calls[1].context.messages[0].content[0].text.includes("a fresh note"));
+});
+
+await check("renderPressSummary appends the referenced files inside Context to Preserve", async () => {
+	const summary = {
+		taskOverview: "did the work",
+		currentState: "working",
+		discoveries: "",
+		nextSteps: "",
+		context: "the user wants this to stay short",
+	};
+	const files = ["src/compact.ts", "src/state.ts"];
+
+	const rendered = renderPressSummary(summary, files);
+	assert.equal(
+		rendered,
+		"<press-summary>\n" +
+			"## Task Overview\ndid the work\n\n" +
+			"## Current State\nworking\n\n" +
+			"## Context to Preserve\nthe user wants this to stay short\n\n" +
+			"Recently referenced files:\n- src/compact.ts\n- src/state.ts\n" +
+			"</press-summary>",
+	);
+
+	// The parser reads the whole block back, list included: the files line sits in the section body.
+	const parsed = parsePressSummary(rendered);
+	assert.equal(
+		parsed.context,
+		"the user wants this to stay short\n\nRecently referenced files:\n- src/compact.ts\n- src/state.ts",
+	);
+	assert.equal(parsed.taskOverview, "did the work");
+
+	// The section still renders when the model left it empty and only the list is there.
+	const empty = renderPressSummary({ ...summary, context: "" }, ["src/foo.ts"]);
+	assert.equal(parsePressSummary(empty).context, "Recently referenced files:\n- src/foo.ts");
+
+	// No files, or an empty list, renders exactly what the model produced.
+	assert.equal(renderPressSummary(summary), renderPressSummary(summary, []));
+	assert.ok(!renderPressSummary(summary).includes("Recently referenced files"));
+	assert.ok(!renderPressSummary({ ...summary, context: "" }).includes("## Context to Preserve"));
+});
+
+await check("a compaction records the files its tool calls named", async () => {
+	const { ctx, calls } = fakeCtx({ respond: () => OK });
+	const messages = [
+		user("do the thing"),
+		{
+			role: "assistant",
+			content: [{ type: "toolCall", name: "read", arguments: { path: "src/compact.ts" } }],
+		},
+		toolResult("read", "contents"),
+		assistant("read it"),
+	];
+
+	const result = await compactContext(ctx, messages, 1, undefined, SETTINGS);
+	assert.equal(result.kind, "compacted");
+	const text = result.message.content[0].text;
+	assert.ok(text.includes("Recently referenced files:\n- src/compact.ts"), text);
+	assert.equal(parsePressSummary(text).context, "Recently referenced files:\n- src/compact.ts");
+	assert.ok(
+		!calls[0].context.messages[0].content[0].text.includes("Recently referenced"),
+		"the files are recorded, not prompted for",
+	);
+});
+
 // ---------------------------------------------------------------- press tool
 
 /** The tool definition, registered against the per-registration state a case owns. */
@@ -697,8 +1025,8 @@ await check("press compacts the cached messages and hands the model the summary"
 		assert.equal(result.details.kept, 1);
 		assert.equal(calls.length, 1, "one summary call is spent");
 		assert.ok(
-			calls[0].context.messages[0].content[0].text.includes("keep the migration plan"),
-			"the note also reaches the compaction prompt, to steer what is preserved",
+			!calls[0].context.messages[0].content[0].text.includes("keep the migration plan"),
+			"the note is appended outside the model's answer, never prompted into it",
 		);
 
 		// The handoff the context hook consumes: the summary message, then the untouched tail.
@@ -799,6 +1127,201 @@ await check("a compaction model failure reaches the model as an error result", a
 	}
 });
 
+// ----------------------------------------------------------------- trim tool
+
+/** The trim tool definition, registered against the per-registration state a case owns. */
+function trimTool(state = createPressState()) {
+	const tools = [];
+	registerTrimTool({ registerTool: (definition) => tools.push(definition) }, state);
+	assert.equal(tools.length, 1, "exactly one tool is registered");
+	return tools[0];
+}
+
+/** A conversation whose token cost sits in old tool results, which is what trim is for. */
+function trimmableConversation() {
+	return [
+		user("do the thing"),
+		{
+			role: "assistant",
+			content: [{ type: "toolCall", name: "read", arguments: { path: "src/compact.ts" } }],
+		},
+		toolResult("read", "a very long file read"),
+		assistant("read it"),
+		{
+			role: "assistant",
+			content: [{ type: "toolCall", name: "bash", arguments: { command: "npm test" } }],
+		},
+		toolResult("bash", "a very long test log"),
+		assistant("tests pass"),
+	];
+}
+
+await check("the trim tool declares optional note and keep parameters", async () => {
+	const tool = trimTool();
+	assert.equal(tool.name, "trim");
+	assert.equal(typeof tool.label, "string");
+	assert.equal(typeof tool.description, "string");
+	assert.equal(tool.executionMode, "sequential", "a trim rewrites the conversation");
+
+	const schema = tool.parameters;
+	assert.deepEqual(Object.keys(schema.properties).sort(), ["keep", "note"]);
+	assert.equal(schema.properties.note.type, "string");
+	assert.equal(schema.properties.keep.type, "integer");
+	assert.equal(schema.properties.keep.default, 1, "keep defaults to the last message only");
+	assert.deepEqual(schema.required ?? [], [], "both parameters are optional");
+});
+
+await check("both tools declare no prompt snippet and no mode parameter", async () => {
+	const press = pressTool();
+	const tool = trimTool();
+
+	for (const definition of [press, tool]) {
+		assert.equal(definition.promptSnippet, undefined, "no snippet is registered");
+		assert.equal(definition.promptGuidelines, undefined, "no guidelines are registered");
+		assert.ok(
+			!("mode" in definition.parameters.properties),
+			"press and trim stay separate tools rather than one with a mode parameter",
+		);
+	}
+
+	assert.match(press.description, /trim/, "press points at trim as the cheap alternative");
+	assert.match(tool.description, /press/, "trim points back at press for a full summary");
+	assert.match(tool.description, /no model call/, "the description says why trim is cheap");
+});
+
+await check("trim replaces old tool results and stages an anchor plus the trimmed run", async () => {
+	resetSettings();
+	const state = createPressState();
+	const messages = trimmableConversation();
+	state.cacheMessages(messages);
+
+	const result = await trimTool(state).execute("call-1", { keep: 1 }, undefined, undefined, undefined);
+
+	assert.notEqual(result.isError, true, "a trim is not an error result");
+	assert.equal(
+		result.content[0].text,
+		"Context trimmed.\n- 2 tool results replaced with [trimmed]\n- last 1 messages kept verbatim",
+		"the tool result the model reads is counts only",
+	);
+	assert.equal(result.details.status, "trimmed");
+	assert.equal(result.details.trimmed, 2);
+	assert.equal(result.details.kept, 1);
+
+	const staged = state.staged();
+	assert.equal(staged.messages.length, messages.length + 1, "the anchor leads the trimmed run");
+	const anchor = staged.messages[0];
+	assert.equal(anchor.role, "assistant");
+	assert.equal(
+		anchor.content[0].text,
+		"<press-trim>\n2 tool results replaced with [trimmed].\nRecently referenced files: src/compact.ts.\n</press-trim>",
+		"the anchor states what was trimmed and which files the run had touched",
+	);
+	assert.deepEqual(
+		staged.messages.slice(1).map((message) => message.role),
+		messages.map((message) => message.role),
+		"every message survives the trim, so the toolCall -> toolResult chain stays intact",
+	);
+	assert.equal(staged.messages[3].content[0].text, "[trimmed]", "the old read result is a placeholder");
+	assert.equal(staged.messages[6].content[0].text, "[trimmed]", "and so is the old bash log");
+	assert.deepEqual(staged.messages.at(-1), messages.at(-1), "the kept tail is verbatim");
+	assert.deepEqual(staged.base, messages, "the staged trim records what it was made from");
+	assert.ok(
+		!state.cachedMessages().some((message) => message.content?.[0]?.text === "[trimmed]"),
+		"the tool does not mutate the cached conversation",
+	);
+});
+
+await check("the trim note travels inside the anchor block", async () => {
+	resetSettings();
+	const state = createPressState();
+	state.cacheMessages(trimmableConversation());
+
+	const result = await trimTool(state).execute(
+		"call-1",
+		{ keep: 2, note: "  decided to keep the schema stable  " },
+		undefined,
+		undefined,
+		undefined,
+	);
+
+	assert.equal(result.details.kept, 2, "keep is honoured");
+	const text = state.staged().messages[0].content[0].text;
+	assert.match(text, /Note: decided to keep the schema stable/, "the note is trimmed and recorded");
+	assert.ok(text.startsWith("<press-trim>\n") && text.endsWith("\n</press-trim>"), "inside the block");
+	assert.ok(
+		!result.content[0].text.includes("decided to keep"),
+		"the tool result stays factual: the model reads its note back from the anchor",
+	);
+	assert.equal(
+		findAnchor(state.staged().messages).text.split("\n").at(-1),
+		"Note: decided to keep the schema stable",
+		"a later findAnchor surfaces the note to the next compaction",
+	);
+
+	// A whitespace-only note leaves no line behind at all.
+	state.clearStaged();
+	const blank = await trimTool(state).execute("call-2", { keep: 1, note: "   " }, undefined, undefined, undefined);
+	assert.notEqual(blank.details.status, "skipped");
+	assert.ok(!state.staged().messages[0].content[0].text.includes("Note:"));
+
+	// No file-naming tool calls means no files line either.
+	state.clearStaged();
+	state.cacheMessages([user("one"), assistant("two"), toolResult("bash", "log"), assistant("three")]);
+	await trimTool(state).execute("call-3", { keep: 1 }, undefined, undefined, undefined);
+	assert.equal(
+		state.staged().messages[0].content[0].text,
+		"<press-trim>\n1 tool results replaced with [trimmed].\n</press-trim>",
+		"the files line is omitted when nothing was referenced",
+	);
+});
+
+await check("trim reports a context with nothing to trim without staging", async () => {
+	resetSettings();
+	const state = createPressState();
+
+	const empty = await trimTool(state).execute("call-1", {}, undefined, undefined, undefined);
+	assert.equal(empty.isError, true, "an empty cache is an error result");
+	assert.equal(empty.content[0].text, NO_MESSAGES_NOTE);
+	assert.equal(empty.details.status, "error");
+	assert.equal(state.staged(), undefined);
+
+	// An already-small conversation: keep 7 of seven messages leaves nothing to trim.
+	state.cacheMessages(trimmableConversation());
+	const small = await trimTool(state).execute("call-2", { keep: 7 }, undefined, undefined, undefined);
+	assert.notEqual(small.isError, true, "a small context is a normal result, not a failure");
+	assert.match(small.content[0].text, /leaves nothing to trim/);
+	assert.equal(small.details.status, "skipped");
+	assert.equal(small.details.trimmed, 0);
+	assert.equal(state.staged(), undefined, "nothing is staged for the context hook");
+
+	// A conversation with no tool results at all: nothing to replace.
+	state.cacheMessages([user("one"), assistant("two"), user("three"), assistant("four")]);
+	const noResults = await trimTool(state).execute("call-3", { keep: 1 }, undefined, undefined, undefined);
+	assert.match(noResults.content[0].text, /No tool results to trim/);
+	assert.equal(noResults.details.status, "skipped");
+	assert.equal(state.staged(), undefined);
+});
+
+await check("a trim a context pass later installs leaves the anchor in the conversation", async () => {
+	resetSettings();
+	const root = tempProject();
+	try {
+		const registration = captureRegistration();
+		const messages = trimmableConversation();
+
+		await contextPass(registration, messages, DEFAULT_WARN_TOKENS - 1, root);
+		const trimmer = registration.tools.find((definition) => definition.name === "trim");
+		await trimmer.execute("call-1", { keep: 1, note: "the plan holds" }, undefined, undefined, undefined);
+
+		const installed = await contextPass(registration, messages, DEFAULT_WARN_TOKENS - 1, root);
+		assert.equal(installed.messages.length, messages.length + 1, "the anchor is added, nothing dropped");
+		assert.match(installed.messages[0].content[0].text, /^<press-trim>/, "the anchor leads");
+		assert.equal(findAnchor(installed.messages).kind, "trim", "and the next compaction sees it");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 // -------------------------------------------------------------- context hook
 
 /**
@@ -827,21 +1350,45 @@ function captureRegistration() {
 		registerTool: (definition) => tools.push(definition),
 		on: (event, handler) => handlers.push({ event, handler }),
 	});
-	return { tool: tools[0], handler: handlers[0].handler };
+	return { tool: tools[0], tools, handler: handlers[0].handler };
 }
 
 /** The hook's `ctx`: only context usage and a cwd are read from it. */
 function hookCtx(tokens, cwd = tmpdir()) {
+	// pi reports `percent` already scaled to 0-100, so a 1M window makes the arithmetic exact.
 	return {
 		cwd,
 		getContextUsage: () =>
-			tokens === undefined ? undefined : { tokens, contextWindow: 1_000_000, percent: 0.5 },
+			tokens === undefined
+				? undefined
+				: {
+						tokens,
+						contextWindow: 1_000_000,
+						percent: tokens === null ? null : Math.round(tokens / 10_000),
+					},
 	};
 }
 
 /** A pass over `messages`, as pi's runner would emit it, for one registration's hook. */
 function contextPass(registration, messages, tokens, cwd, extra) {
 	return registration.handler({ type: "context", messages }, { ...hookCtx(tokens, cwd), ...extra });
+}
+
+/**
+ * A pass driven through `handleContext` directly, with the flag state in the case's own hands.
+ *
+ * The registration helper above owns its flags privately, which is the right shape for the
+ * extension but hides them from a case that has to assert on both of them.
+ */
+function directHook() {
+	const press = createPressState();
+	const state = { warned: false, criticallyWarned: false };
+	return {
+		state,
+		press,
+		pass: (messages, tokens, cwd = tmpdir(), extra) =>
+			handleContext({ type: "context", messages }, { ...hookCtx(tokens, cwd), ...extra }, state, press),
+	};
 }
 
 /** An assistant turn that ends by requesting a tool: mid-turn, never a compaction point. */
@@ -933,14 +1480,14 @@ await check("token pressure is only checked at an assistant text turn boundary",
 		// there, and acting would rewrite the conversation around results still arriving.
 		const afterToolResult = [user("one"), assistantToolCall(), toolResult("read", "contents")];
 		assert.equal(
-			await contextPass(hook, afterToolResult, DEFAULT_FORCE_TOKENS, root),
+			await contextPass(hook, afterToolResult, DEFAULT_CRITICAL_TOKENS, root),
 			undefined,
 			"a trailing tool result does not warn",
 		);
 
 		const awaitingTool = [user("one"), assistant("two"), assistantToolCall()];
 		assert.equal(
-			await contextPass(hook, awaitingTool, DEFAULT_FORCE_TOKENS, root),
+			await contextPass(hook, awaitingTool, DEFAULT_CRITICAL_TOKENS, root),
 			undefined,
 			"an assistant message that requests a tool does not warn",
 		);
@@ -1033,7 +1580,7 @@ await check("a staged compaction replaces the conversation", async () => {
 
 	// Consumption is checked above any threshold: a staged compaction from a manual `press`
 	// must not also draw a warning about the pressure it just relieved.
-	const result = await contextPass(hook, messages, DEFAULT_FORCE_TOKENS, tmpdir());
+	const result = await contextPass(hook, messages, DEFAULT_CRITICAL_TOKENS, tmpdir());
 	assert.deepEqual(result.messages, [summary, kept], "the summary and the kept tail stand in");
 	assert.equal(hook.state.staged(), undefined, "a staged compaction is consumed exactly once");
 });
@@ -1119,38 +1666,41 @@ await check("a compaction clears the warning flag", async () => {
 	}
 });
 
-// ---------------------------------------------------- forced compaction
+// ---------------------------------------------------- critical warning
 
-await check("the hard limit force-compacts and keeps the last message verbatim", async () => {
+await check("the critical threshold injects the urgent warning and spends no model call", async () => {
 	resetSettings();
 	const root = tempProject();
-	const hook = contextHook();
-	const messages = [user("one"), assistant("two"), user("three"), assistant("four")];
+	const hook = directHook();
+	const messages = [user("one"), assistant("two")];
 	try {
 		const { ctx, calls } = fakeCtx({ respond: () => OK });
 
-		const below = await contextPass(hook, messages, DEFAULT_FORCE_TOKENS - 1, root, ctx);
-		assert.equal(calls.length, 0, "under the limit nothing is compacted");
-		assert.equal(below.messages.length, messages.length + 1, "under the limit the warning still fires");
+		const below = await hook.pass(messages, DEFAULT_CRITICAL_TOKENS - 1, root, ctx);
+		assert.equal(below.messages.length, messages.length + 1, "under the critical limit the regular warning fires");
+		assert.match(below.messages.at(-1).content[0].text, /warning threshold/);
 
-		const forced = await contextPass(hook, messages, DEFAULT_FORCE_TOKENS, root, ctx);
-		assert.equal(calls.length, 1, "the limit spends one compaction call");
-		assert.equal(forced.messages.length, 2, "the conversation collapses to the summary and the tail");
-		assert.match(forced.messages[0].content[0].text, /^<press-summary>/, "the summary leads");
-		assert.deepEqual(forced.messages[1], messages.at(-1), "the last message survives verbatim");
-
-		// The note is appended to the summary itself, so it survives a model that answered with
-		// no Notes section at all - which is what the fixture does.
-		const text = forced.messages[0].content[0].text;
-		assert.ok(
-			text.endsWith("Context was force-compacted due to token limit"),
-			`the note is guaranteed to reach the model, got: ${text}`,
+		const critical = await hook.pass(messages, DEFAULT_CRITICAL_TOKENS, root, ctx);
+		assert.equal(calls.length, 0, "the hook never calls a model: it only warns");
+		assert.equal(
+			critical.messages.length,
+			messages.length + 1,
+			"the critical warning is appended, not substituted",
 		);
-		assert.equal(parsePressSummary(text).context, "", "the block is unchanged by the appended note");
+		assert.deepEqual(critical.messages.slice(0, messages.length), messages, "the conversation is untouched");
 
-		assert.ok(
-			calls[0].context.messages[0].content[0].text.includes("Context was force-compacted due to token limit"),
-			"the prompt carries the forced-compaction note too",
+		const warning = critical.messages.at(-1);
+		assert.equal(warning.role, "system", "the critical warning must be a system message");
+		assert.equal(typeof warning.timestamp, "number");
+		assert.match(warning.content[0].text, /critically/i, "it says how bad it is");
+		assert.ok(warning.content[0].text.includes(String(DEFAULT_CRITICAL_TOKENS)), "it states the tokens");
+		assert.match(warning.content[0].text, /50%/, "and the share of the window in use");
+		assert.match(warning.content[0].text, /press/, "it names press");
+		assert.match(warning.content[0].text, /trim/, "and the cheap tool as well");
+		assert.deepEqual(
+			hook.press.cachedMessages(),
+			messages,
+			"our own warning is not cached, so press never summarizes it",
 		);
 	} finally {
 		resetSettings();
@@ -1158,7 +1708,23 @@ await check("the hard limit force-compacts and keeps the last message verbatim",
 	}
 });
 
-await check("the hard limit is only acted on at an assistant text turn boundary", async () => {
+await check("both tools are named in the regular warning text", async () => {
+	resetSettings();
+	const root = tempProject();
+	const hook = contextHook();
+	const messages = [user("one"), assistant("two")];
+	try {
+		const result = await contextPass(hook, messages, DEFAULT_WARN_TOKENS, root);
+		const text = result.messages.at(-1).content[0].text;
+		assert.match(text, /press/, "the warning names press");
+		assert.match(text, /trim/, "and trim, the tool that needs no model call");
+		assert.match(text, /\[trimmed\]/, "saying what trim actually does to the conversation");
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the critical warning is only injected at an assistant text turn boundary", async () => {
 	resetSettings();
 	const root = tempProject();
 	const hook = contextHook();
@@ -1167,110 +1733,108 @@ await check("the hard limit is only acted on at an assistant text turn boundary"
 
 		const midTurn = [user("one"), assistantToolCall(), toolResult("read", "contents")];
 		assert.equal(
-			await contextPass(hook, midTurn, DEFAULT_FORCE_TOKENS, root, ctx),
+			await contextPass(hook, midTurn, DEFAULT_CRITICAL_TOKENS, root, ctx),
 			undefined,
-			"a trailing tool result is mid-turn and must not be compacted",
+			"a trailing tool result is mid-turn and must not be warned about",
 		);
 		assert.equal(
-			await contextPass(hook, [user("one"), assistant("two"), assistantToolCall()], DEFAULT_FORCE_TOKENS, root, ctx),
+			await contextPass(hook, [user("one"), assistant("two"), assistantToolCall()], DEFAULT_CRITICAL_TOKENS, root, ctx),
 			undefined,
-			"an assistant turn that requests a tool must not be compacted",
+			"an assistant turn that requests a tool must not be warned about either",
 		);
-		assert.equal(calls.length, 0, "a mid-turn limit spends no compaction call");
+		assert.equal(calls.length, 0, "a mid-turn limit spends no call");
 
 		const boundary = [user("one"), assistant("two")];
-		const forced = await contextPass(hook, boundary, DEFAULT_FORCE_TOKENS, root, ctx);
-		assert.equal(forced.messages.length, 2, "the same pressure at a boundary does compact");
+		const warned = await contextPass(hook, boundary, DEFAULT_CRITICAL_TOKENS, root, ctx);
+		assert.equal(warned.messages.length, boundary.length + 1, "the same pressure at a boundary does warn");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("a failed forced compaction returns the conversation plus one error note", async () => {
+await check("a session warned at the regular threshold still gets the critical warning", async () => {
 	resetSettings();
+	const hook = directHook();
 	const root = tempProject();
-	const hook = contextHook();
 	const messages = [user("one"), assistant("two")];
 	try {
-		const provider = fakeCtx({
-			respond: () => ({ stopReason: "error", errorMessage: "provider exploded", content: [] }),
-		});
+		const regular = await hook.pass(messages, DEFAULT_WARN_TOKENS, root);
+		assert.equal(regular.messages.length, messages.length + 1, "the regular crossing warns");
+		assert.ok(!/critically/i.test(regular.messages.at(-1).content[0].text));
+		assert.equal(hook.state.warned, true);
+		assert.equal(hook.state.criticallyWarned, false, "the regular crossing arms only its own flag");
 
-		const failed = await contextPass(hook, messages, DEFAULT_FORCE_TOKENS, root, provider.ctx);
-		assert.equal(failed.messages.length, messages.length + 1, "the conversation is handed back untouched");
-		assert.deepEqual(failed.messages.slice(0, messages.length), messages, "not one message is lost");
-		const note = failed.messages.at(-1);
-		assert.equal(note.role, "system", "the failure is reported as a system note");
-		assert.match(note.content[0].text, /provider exploded/, "it names the provider's reason");
-		assert.match(note.content[0].text, /did not happen/, "and says the compaction did not happen");
-		assert.equal(provider.calls.length, 1, "the failed call is not retried inside the pass");
+		// The critical warning is a crossing of its own: being warned already does not suppress it.
+		const critical = await hook.pass(messages, DEFAULT_CRITICAL_TOKENS, root);
+		assert.equal(critical.messages.length, messages.length + 1, "the critical crossing warns anyway");
+		assert.match(critical.messages.at(-1).content[0].text, /critically/i);
+		assert.equal(hook.state.criticallyWarned, true);
+		assert.equal(hook.state.warned, true, "the regular flag is left as it was");
 
-		// A caller that throws is reported the same way, and still no loop.
-		const throwing = fakeCtx({
-			respond: () => {
-				throw new Error("socket closed");
-			},
-		});
-		const thrown = await contextPass(hook, messages, DEFAULT_FORCE_TOKENS, root, throwing.ctx);
-		assert.equal(thrown.messages.length, messages.length + 1);
-		assert.match(thrown.messages.at(-1).content[0].text, /socket closed/);
-		assert.equal(throwing.calls.length, 1, "a throwing client is called once per pass, never in a loop");
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-await check("a forced compaction clears the warning instead of warning about it", async () => {
-	resetSettings();
-	const root = tempProject();
-	const hook = contextHook();
-	const messages = [user("one"), assistant("two")];
-	try {
-		const { ctx } = fakeCtx({ respond: () => OK });
-
-		// Warn first, so the flag is set when the hard limit is reached.
-		const warned = await contextPass(hook, messages, DEFAULT_WARN_TOKENS, root, ctx);
-		assert.equal(warned.messages.length, messages.length + 1, "the crossing warns");
-
-		const forced = await contextPass(hook, messages, DEFAULT_FORCE_TOKENS, root, ctx);
-		assert.equal(forced.messages.length, 2, "the force pass replaces the conversation");
-		assert.ok(
-			!forced.messages.some((message) => message.role === "system"),
-			"no warning is injected alongside the compaction that relieved it",
+		// Each warning is injected once: neither repeats while its flag is set.
+		assert.equal(await hook.pass(messages, DEFAULT_CRITICAL_TOKENS, root), undefined);
+		assert.equal(
+			await hook.pass(messages, DEFAULT_CRITICAL_TOKENS + 1000, root),
+			undefined,
+			"raising pressure further does not re-inject the critical warning",
 		);
-
-		// The flag cleared with the compaction, so pressure building again warns afresh.
-		const after = [forced.messages[0], user("four"), assistant("five")];
-		const second = await contextPass(hook, after, DEFAULT_WARN_TOKENS, root, ctx);
-		assert.equal(second.messages.length, after.length + 1, "the next crossing warns again");
 	} finally {
 		resetSettings();
 		rmSync(root, { recursive: true, force: true });
 	}
 });
 
-await check("a skipped forced compaction resets nothing", async () => {
+await check("a critical crossing sends one message, not the regular warning as well", async () => {
 	resetSettings();
 	const root = tempProject();
-	const hook = contextHook();
+	const hook = directHook();
 	const messages = [user("one"), assistant("two")];
 	try {
-		const { ctx, calls } = fakeCtx({ respond: () => OK });
-		writeScope(root, "project", { [SETTINGS_KEY]: { warnTokens: 10, forceTokens: 20 } });
+		const result = await hook.pass(messages, DEFAULT_CRITICAL_TOKENS, root);
+		const injected = result.messages.slice(messages.length);
+		assert.equal(injected.length, 1, "exactly one message is appended");
+		assert.match(injected[0].content[0].text, /critically/i, "and it is the urgent one");
+		assert.equal(hook.state.warned, false, "the regular flag stays untouched by a critical crossing");
 
-		const warned = await contextPass(hook, messages, 15, root, ctx);
-		assert.equal(warned.messages.length, 3, "the crossing warns and sets the flag");
-
-		// One message with keep 1 leaves nothing to compact, so the engine reports skipped.
-		const skipped = await contextPass(hook, [user("three")], 25, root, ctx);
-		assert.equal(skipped, undefined, "a skipped compaction rewrites nothing");
-		assert.equal(calls.length, 0, "the engine returns before spending a call");
-
-		// The flag survived the skipped pass: pressure that was already warned about stays silent.
-		const again = await contextPass(hook, messages, 15, root, ctx);
-		assert.equal(again, undefined, "no warning is re-injected after a skipped force pass");
+		// A later pass back at the regular threshold still warns, since that flag was never armed.
+		const lower = await hook.pass(messages, DEFAULT_WARN_TOKENS, root);
+		assert.equal(lower.messages.length, messages.length + 1);
+		assert.ok(!/critically/i.test(lower.messages.at(-1).content[0].text));
 	} finally {
-		resetSettings();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("an installed compaction clears both warning flags", async () => {
+	resetSettings();
+	const hook = directHook();
+	const root = tempProject();
+	const before = [user("one"), assistant("two")];
+	const summary = summaryMessage();
+	try {
+		// Arm both flags: the regular crossing first, then the critical one.
+		await hook.pass(before, DEFAULT_WARN_TOKENS, root);
+		const critical = await hook.pass(before, DEFAULT_CRITICAL_TOKENS, root);
+		assert.equal(critical.messages.length, before.length + 1, "the critical crossing warns");
+		assert.equal(hook.state.warned, true);
+		assert.equal(hook.state.criticallyWarned, true);
+
+		// The last pass cached `before`, so that is the conversation the summary describes.
+		hook.press.stageCompacted([summary]);
+		const compacted = await hook.pass(before, DEFAULT_CRITICAL_TOKENS, root);
+		assert.deepEqual(compacted.messages, [summary], "the compaction is installed instead");
+		assert.equal(hook.state.warned, false, "the regular flag clears with the compaction");
+		assert.equal(hook.state.criticallyWarned, false, "and so does the critical one");
+
+		// Fresh headroom means fresh warnings allowed, at both thresholds.
+		const after = [summary, user("four"), assistant("five")];
+		const second = await hook.pass(after, DEFAULT_WARN_TOKENS, root);
+		assert.equal(second.messages.length, after.length + 1, "the next regular crossing warns again");
+
+		const fresh = [summary, user("four"), assistant("five"), user("six"), assistant("seven")];
+		const third = await hook.pass(fresh, DEFAULT_CRITICAL_TOKENS, root);
+		assert.match(third.messages.at(-1).content[0].text, /critically/i, "and the critical one too");
+	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
 });

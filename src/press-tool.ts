@@ -53,7 +53,7 @@ export function registerPressTool(pi: ExtensionAPI, state: PressState): void {
 		name: "press",
 		label: "Compact context",
 		description:
-			"Compact the conversation so far into a summary, keeping the most recent messages verbatim. Call it when the context is getting full and you want to keep working on the same task, instead of asking the user to start over. Pass note describing what matters most to preserve, and raise keep when you are mid-way through a multi-step task.",
+			"Compact the conversation so far into a summary, keeping the most recent messages verbatim. Call it when the context is getting full and you want to keep working on the same task, instead of asking the user to start over. Pass note describing what matters most to preserve, and raise keep when you are mid-way through a multi-step task. When only tokens need freeing and the conversation itself is still worth keeping, call trim instead: it costs no model call.",
 		parameters,
 		// Compaction rewrites the conversation, so it must not overlap with other tool calls.
 		executionMode: "sequential",

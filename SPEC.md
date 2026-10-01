@@ -73,17 +73,17 @@ The LLM produces a `<press-summary>` block containing:
 
 This block replaces all compacted messages as a single assistant message. The kept messages follow it.
 
-### Forced compaction in context hook
+### Token pressure in context hook
 
-The `context` event handler monitors `ctx.getContextUsage().tokens` only when the last message is an assistant text message (not a tool call). This is the natural turn boundary — tool calls and results are mid-turn and shouldn't trigger compaction.
-- If `>= warnTokens` and no warning injected yet → append a warning message to the context (once per session, never reset)
-- If `>= forceTokens` → build snapshot, call LLM, replace messages silently with a note "Context was force-compacted due to token limit"
+The `context` event handler monitors `ctx.getContextUsage().tokens` only when the last message is an assistant text message (not a tool call). This is the natural turn boundary — tool calls and results are mid-turn and shouldn't trigger injection.
+- If `>= warnTokens` and no warning injected yet → append a warning message naming `press` and `trim` (once per threshold crossing)
+- If `>= criticalTokens` and no critical warning injected yet → append a critical warning naming both tools
 
-Warning state is a closure boolean, reset after any compaction (tool or forced). Forced compaction reuses the same snapshot/LLM logic as the tool.
+The hook never calls a model itself: deciding what the conversation should become is the model's job, through `press` or `trim`.
 
-Guards on forced compaction:
+Guards:
 - Only check when last message is assistant text (not tool call)
-- If the compaction LLM call fails → return original messages + inject an error note (do not loop)
+- Two independent flags (regular, critical); both clear when a staged compaction is installed
 
 ### Configuration pattern
 
@@ -92,7 +92,7 @@ Follows pi-summary's pattern: `SettingsManager.create(cwd)` from `@earendil-work
 Config fields:
 - `press.model` (string, optional): compaction model as `provider/id`
 - `press.warnTokens` (number, default 260000): token count for warning injection
-- `press.forceTokens` (number, default 500000): token count for forced compaction
+- `press.criticalTokens` (number, default 500000): critical warning threshold
 
 Unknown/invalid fields are ignored; missing fields use defaults. Malformed config is treated as "not configured" (no error thrown).
 
@@ -123,7 +123,7 @@ Dev deps for development: same packages pinned to `^0.99.2`, plus `typescript`.
 
 - No formal test suite initially (pi-summary uses `smoke.mjs` with a fake API — can adopt later)
 - Manual testing: install extension via `pi -e D:/Code/pi-press`, call `press` tool in a session
-- Verify: config loading (global vs project), tool execution, context hook warnings, forced compaction
+- Verify: config loading (global vs project), tool execution, context hook warnings, critical warning injection
 - The extension is self-contained; no mocks of pi internals needed for initial validation
 - LLM call can be tested by checking the model registry integration against `routerai/deepseek/deepseek-v4.1-flash`
 
@@ -140,10 +140,8 @@ Dev deps for development: same packages pinned to `^0.99.2`, plus `typescript`.
 ## Further Notes
 
 - The extension uses the pi-dcp pattern of caching messages in the `context` handler closure. This means the cache is only as fresh as the last context pass — a known limitation.
-- Forced compaction runs in the `context` hook, not as a tool call. The model sees the compacted context on the next turn with a note about what happened.
+- Critical warnings are injected in the `context` hook; compaction itself happens when the model calls `press` or `trim` on the next turn.
 - The `keep` parameter defaults to 1 (last message only). The model can increase this when mid-task.
-- Warning injection resets after any compaction (tool or forced), so it re-injects if pressure builds again.
-- Forced compaction skips if there are pending tool calls (to avoid losing in-flight results).
-- Forced compaction LLM failure returns original messages + error note (no infinite loop).
+- Warning injection resets after any compaction (`press` or `trim`), so it re-injects if pressure builds again.
 - `keep` > total messages clamps to total — compacts nothing, returns a note.
 - Test model for development: `routerai/deepseek/deepseek-v4.1-flash`

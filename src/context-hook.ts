@@ -4,32 +4,22 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { compactContext, DEFAULT_KEEP, failureText } from "./compact.ts";
 import type { ConversationMessage } from "./compact.ts";
 import { readPressSettings } from "./config.ts";
-import type { PressSettings } from "./config.ts";
 import type { PressState } from "./state.ts";
 
 /** One message of the conversation, as pi's `context` event carries it. */
 type AgentMessage = ContextEvent["messages"][number];
 
 /**
- * The note a forced compaction carries.
+ * Warning text handed to the model when the context crosses the warning threshold.
  *
- * It reaches the next turns twice over: appended to the summary by the engine, outside the
- * compaction model's control, and given to that model in its prompt so it knows why the
- * conversation it is reading is being cut short.
- */
-const FORCE_NOTE = "Context was force-compacted due to token limit";
-
-/**
- * Warning text handed to the model when the context crosses the configured threshold.
- *
- * It names the tool and both of its parameters, because the model reading it has to act on
- * it in one step: nothing else will tell it what `press` accepts.
+ * It names both tools and their parameters, because the model reading it has to act on it in
+ * one step: nothing else will tell it what `press` and `trim` accept, or which of the two the
+ * situation calls for.
  */
 export function warningText(tokens: number, warnTokens: number): string {
-	return `Context usage is at ${tokens} tokens, past the ${warnTokens}-token warning threshold. Call the press tool to compact the conversation into a summary before the context is lost to forced compaction: pass note describing what matters most to preserve, and keep for how many recent messages to leave verbatim.`;
+	return `Context usage is at ${tokens} tokens, past the ${warnTokens}-token warning threshold. Call the press tool to compact the conversation into a summary before the context degrades: pass note describing what matters most to preserve, and keep for how many recent messages to leave verbatim. If only tokens need freeing and the conversation is still worth keeping, call trim instead: it replaces old tool results with [trimmed] and costs no model call.`;
 }
 
 /** The synthetic message appended to the conversation to carry the warning. */
@@ -37,6 +27,26 @@ export function warningMessage(tokens: number, warnTokens: number): AgentMessage
 	return {
 		role: "system",
 		content: [{ type: "text", text: warningText(tokens, warnTokens) }],
+		timestamp: Date.now(),
+	};
+}
+
+/**
+ * Warning text handed to the model when context usage reaches the critical threshold.
+ *
+ * The regular warning says the context is filling up; this one says the next step is already
+ * degrading. It names both tools for the same reason, and it is phrased as an instruction
+ * rather than a status, because the model has to act within one step for it to matter.
+ */
+export function criticalWarningText(tokens: number, percent: number): string {
+	return `Context is critically large: ${tokens} tokens, ${percent}% of the window. The next steps will degrade unless you act now. Call press for a structured summary, or trim to drop old tool results without a model call.`;
+}
+
+/** The synthetic message appended to the conversation to carry the critical warning. */
+export function criticalWarningMessage(tokens: number, percent: number): AgentMessage {
+	return {
+		role: "system",
+		content: [{ type: "text", text: criticalWarningText(tokens, percent) }],
 		timestamp: Date.now(),
 	};
 }
@@ -70,21 +80,24 @@ export function isAssistantTextMessage(message: unknown): boolean {
  * summary was made from are literally the ones now in front of us. A conversation that no
  * longer holds them was rebuilt elsewhere, and the summary describes a history that is gone.
  */
-function startsWith(conversation: readonly ConversationMessage[], base: readonly ConversationMessage[]): boolean {
+function hasPrefix(conversation: readonly ConversationMessage[], base: readonly ConversationMessage[]): boolean {
 	return base.length <= conversation.length && base.every((message, index) => conversation[index] === message);
 }
 
 /**
  * Register the `context` hook: the only place with a writable view of the conversation.
  *
- * It runs before every LLM call and does four things, in order:
+ * It runs before every LLM call and does three things, in order:
  *
- * 1. Caches `event.messages` for the `press` tool (see src/state.ts).
- * 2. Installs a compaction the tool staged, unless the conversation has moved on past it
+ * 1. Caches `event.messages` for the `press` and `trim` tools (see src/state.ts).
+ * 2. Installs a compaction a tool staged, unless the conversation has moved on past it
  *    mid-turn - in which case the install is deferred, never dropped.
- * 3. Force-compacts silently when context usage crosses `press.forceTokens`, which is the
- *    safety net for a model that never called `press` on its own.
- * 4. Warns the model once when context usage crosses `press.warnTokens`.
+ * 3. Appends a warning when context usage crosses a threshold: a critical one at
+ *    `press.criticalTokens`, otherwise a regular one at `press.warnTokens`.
+ *
+ * The hook never calls a model itself. Deciding what the conversation should become is the
+ * model's job, through `press` or `trim`; the hook only reports the pressure and installs what
+ * the tools produced, which is what keeps warning text and compaction under one owner each.
  *
  * Settings are re-read on every pass rather than cached at load: a pass already costs a
  * provider round trip, the read is a local file, and this keeps an edited threshold live
@@ -94,28 +107,37 @@ function startsWith(conversation: readonly ConversationMessage[], base: readonly
  * conversation or each other's pending compaction.
  */
 export function registerContextHook(pi: ExtensionAPI, state: PressState): void {
-	const hook: ContextHookState = { warned: false };
+	const hook: ContextHookState = { warned: false, criticallyWarned: false };
 	pi.on("context", (event, ctx) => handleContext(event, ctx, hook, state));
 }
 
 /**
  * State the hook carries between `context` passes.
  *
- * Created per registration, so it lives and dies with the loaded extension. The warning is
- * injected once per threshold crossing and the flag clears on any compaction, which is how
- * pressure that builds up again gets its own warning.
+ * Created per registration, so it lives and dies with the loaded extension. Each warning is
+ * injected once per threshold crossing - one flag per threshold, so a session that was already
+ * warned at the regular threshold still gets the critical warning when it reaches the critical
+ * one - and both flags clear on any compaction, which is how pressure that builds up again gets
+ * its own warning.
  */
 export type ContextHookState = {
-	/** Whether the warning has been appended and no compaction has cleared it yet. */
+	/** Whether the regular warning has been appended and no compaction has cleared it yet. */
 	warned: boolean;
+	/** Whether the critical warning has been appended and no compaction has cleared it yet. */
+	criticallyWarned: boolean;
 };
 
 /**
  * One `context` pass.
  *
- * Exported as the seam for forced compaction: the force branch reads the same `tokens` and
- * `settings` and slots in above the warning, so a force pass replaces the conversation and
- * never also warns about it.
+ * The order is fixed by what each step needs: the cache is refreshed first because a staged
+ * compaction may be replaced by it, the install comes next because it is the only step that can
+ * rewrite the conversation, and the token checks come last because a compaction has just
+ * relieved the pressure they measure.
+ *
+ * The critical threshold takes precedence over the regular one, and they share this pass rather
+ * than both firing: at that pressure the model needs the urgent instruction, not two messages
+ * saying the same thing.
  */
 export async function handleContext(
 	event: ContextEvent,
@@ -130,27 +152,41 @@ export async function handleContext(
 	const installed = installStaged(event, press);
 	if (installed !== undefined) {
 		// A compaction just landed. Its summary has no pressure behind it, and the next
-		// threshold crossing deserves a fresh warning, so the flag clears here.
+		// threshold crossing deserves a fresh warning, so both flags clear here.
 		state.warned = false;
+		state.criticallyWarned = false;
 		return { messages: asAgentMessages(installed) };
 	}
 
 	// Turn boundary first: it costs nothing and most passes end mid-turn.
 	if (!isAssistantTextMessage(event.messages.at(-1))) return undefined;
 
-	const tokens = ctx.getContextUsage()?.tokens;
-	if (tokens === undefined || tokens === null) return undefined;
+	const usage = ctx.getContextUsage();
+	if (usage === undefined) return undefined;
+	const tokens = usage.tokens;
+	if (tokens === null) return undefined;
 
 	const settings = readPressSettings(ctx.cwd);
 
-	// The hard limit first: at this pressure the conversation is compacted whether the model
-	// asked or not, and the pass ends here so the warning is never injected alongside it.
-	if (tokens >= settings.forceTokens) return forceCompact(event, ctx, state, settings);
+	// The critical threshold first. It is a crossing of its own: a session warned at the regular
+	// threshold is still told, in no uncertain terms, that the situation has changed.
+	if (tokens >= settings.criticalTokens) {
+		if (state.criticallyWarned) return undefined;
+		state.criticallyWarned = true;
+		return {
+			messages: [...event.messages, criticalWarningMessage(tokens, percentOf(usage.percent))],
+		};
+	}
 
 	if (tokens < settings.warnTokens || state.warned) return undefined;
 
 	state.warned = true;
 	return { messages: [...event.messages, warningMessage(tokens, settings.warnTokens)] };
+}
+
+/** The whole-number percentage of the context window in use, for the critical warning. */
+function percentOf(percent: number | null | undefined): number {
+	return Math.round(percent ?? 0);
 }
 
 /**
@@ -160,8 +196,8 @@ export async function handleContext(
  * array. That makes the timing the whole problem, and there are three cases:
  *
  * - The conversation it was made from is no longer in front of us. Something else rebuilt the
- *   history (a forced compaction, another handler), so the summary describes a session that
- *   has moved on: it is dropped rather than installed over the wrong conversation.
+ *   history (the other tool, another handler), so the summary describes a session that has
+ *   moved on: it is dropped rather than installed over the wrong conversation.
  * - The conversation has grown with work the summary never saw - the tool results that
  *   followed the `press` call, possibly for tools the model called alongside it. Installing
  *   now would drop them, and the model would never read a result it asked for, so the install
@@ -178,7 +214,7 @@ function installStaged(
 	const staged = press.staged();
 	if (staged === undefined) return undefined;
 
-	if (!startsWith(event.messages, staged.base)) {
+	if (!hasPrefix(event.messages, staged.base)) {
 		press.clearStaged();
 		return undefined;
 	}
@@ -191,60 +227,10 @@ function installStaged(
 }
 
 /**
- * Force-compact the conversation because context usage has reached the hard limit.
- *
- * The engine does the work: a forced compaction is a `press` with the default `keep`, so
- * everything but the last message is summarized and the last message is preserved verbatim.
- * The difference is who decides - here nobody does, which is why the pass returns the rebuilt
- * array in place of the one pi handed over.
- *
- * A failure never retries inside the pass. A provider that is down would otherwise spin on
- * every pass, so the conversation is handed back untouched with a note saying what happened,
- * and the next turn decides what to do about it.
- */
-async function forceCompact(
-	event: ContextEvent,
-	ctx: ExtensionContext,
-	state: ContextHookState,
-	settings: PressSettings,
-): Promise<ContextEventResult | undefined> {
-	try {
-		const result = await compactContext(ctx, event.messages, DEFAULT_KEEP, FORCE_NOTE, settings);
-
-		if (result.kind === "skipped") {
-			// Nothing was compacted, so this pass changed nothing - and the warning flag is left
-			// as it was. Clearing it here would re-arm a warning for pressure that never went away.
-			return undefined;
-		}
-
-		// Any compaction relieves the pressure the warning was about, so the next crossing gets
-		// its own warning (the same reset the staged-compaction branch performs above).
-		state.warned = false;
-		return { messages: asAgentMessages([result.message, ...result.kept]) };
-	} catch (error) {
-		return { messages: [...event.messages, forceFailureMessage(error)] };
-	}
-}
-
-/** The synthetic message that reports a failed forced compaction to the model. */
-function forceFailureMessage(error: unknown): AgentMessage {
-	return {
-		role: "system",
-		content: [
-			{
-				type: "text",
-				text: `The context is over the token limit but forced compaction did not happen, so the conversation is unchanged. ${failureText(error)}\n\nCall the press tool to compact the conversation yourself.`,
-			},
-		],
-		timestamp: Date.now(),
-	};
-}
-
-/**
  * Present engine messages back to pi.
  *
  * The engine reads and writes messages structurally (`ConversationMessage`, see src/compact.ts)
- * so the hook, the tool and smoke.mjs share one shape; what it stages is a plain
+ * so the hook, the tools and smoke.mjs share one shape; what it stages is a plain
  * `{role, content, timestamp}` object that satisfies a real message without carrying pi's
  * provider bookkeeping. Only the check needs the cast, and it happens at this one boundary.
  */

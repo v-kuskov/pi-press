@@ -12,32 +12,34 @@ export const SETTINGS_KEY = "press";
 /** Context tokens at or above which the model is warned that it should press. */
 export const DEFAULT_WARN_TOKENS = 260000;
 
-/** Context tokens at or above which the context is force-compacted. */
-export const DEFAULT_FORCE_TOKENS = 500000;
+/** Context tokens at or above which a critical warning is injected. */
+export const DEFAULT_CRITICAL_TOKENS = 500000;
 
 /** Extracted form of the `press` settings key, with every field resolved. */
 export type PressSettings = {
 	/** Compaction model as `provider/id`. Absent means "use the session model". */
 	model?: string;
 	warnTokens: number;
-	forceTokens: number;
+	/** Context tokens at or above which a critical warning is injected. */
+	criticalTokens: number;
 };
 
 /** The value of one configured field, or undefined when it was absent or unusable. */
 type PartialPressSettings = {
 	model?: string;
 	warnTokens?: number;
-	forceTokens?: number;
+	criticalTokens?: number;
 };
 
 /**
  * Read the `press` key from pi's settings, project scope winning field by field.
  *
- * Field-by-field precedence keeps a project override narrow: setting `press.forceTokens`
+ * Field-by-field precedence keeps a project override narrow: setting `press.criticalTokens`
  * in a project must not discard the `press.model` the user configured globally.
  *
  * A malformed or unreadable config is reported as "not configured" rather than thrown,
- * because every field has a working default - the session model, and the two thresholds.
+ * because every field has a working default - the session model, and the two warning
+ * thresholds.
  */
 export function readPressSettings(cwd: string): PressSettings {
 	let settings: SettingsManager;
@@ -55,13 +57,13 @@ export function readPressSettings(cwd: string): PressSettings {
 		// Omitted rather than set to undefined, so a caller can test for the key itself.
 		...(model === undefined ? {} : { model }),
 		warnTokens: project.warnTokens ?? global.warnTokens ?? DEFAULT_WARN_TOKENS,
-		forceTokens: project.forceTokens ?? global.forceTokens ?? DEFAULT_FORCE_TOKENS,
+		criticalTokens: project.criticalTokens ?? global.criticalTokens ?? DEFAULT_CRITICAL_TOKENS,
 	};
 }
 
 /** Defaults for every field, the configuration used when nothing usable is configured. */
 function defaults(): PressSettings {
-	return { warnTokens: DEFAULT_WARN_TOKENS, forceTokens: DEFAULT_FORCE_TOKENS };
+	return { warnTokens: DEFAULT_WARN_TOKENS, criticalTokens: DEFAULT_CRITICAL_TOKENS };
 }
 
 /**
@@ -91,8 +93,8 @@ function normalizePressValue(raw: unknown): PartialPressSettings {
 	const warnTokens = tokenCount(source.warnTokens);
 	if (warnTokens !== undefined) out.warnTokens = warnTokens;
 
-	const forceTokens = tokenCount(source.forceTokens);
-	if (forceTokens !== undefined) out.forceTokens = forceTokens;
+	const criticalTokens = tokenCount(source.criticalTokens);
+	if (criticalTokens !== undefined) out.criticalTokens = criticalTokens;
 
 	return out;
 }

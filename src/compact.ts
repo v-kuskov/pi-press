@@ -66,6 +66,30 @@ export type Compacted = {
 /** Either a compaction happened, or there was nothing to compact. */
 export type CompactionResult = Compacted | { kind: "skipped"; note: string };
 
+/**
+ * A compaction already present in the conversation.
+ *
+ * `text` is the inside of the block - the summary's sections, or a trim note's prose - and
+ * `afterIndex` is the anchor message's own index, so `messages.slice(afterIndex + 1)` is
+ * exactly the run a fresh compaction covers.
+ */
+export type Anchor =
+	| { kind: "summary"; text: string; afterIndex: number }
+	| { kind: "trim"; text: string; afterIndex: number };
+
+/** What a trimming pass produced: replaced tool results, or a reason there was nothing. */
+export type TrimResult =
+	| {
+			kind: "trimmed";
+			/** The rebuilt run: the anchor region untouched, candidate tool results replaced. */
+			messages: ConversationMessage[];
+			/** Tool results replaced with the placeholder. */
+			trimmed: number;
+			/** Messages preserved verbatim at the tail. */
+			kept: number;
+	  }
+	| { kind: "nothing"; note: string };
+
 /** The parts of a model response the engine reads. */
 export type CompactionResponse = {
 	stopReason?: string;
@@ -148,11 +172,176 @@ export function buildSnapshot(
 }
 
 /**
+ * The last compaction already in the conversation, and where it sits.
+ *
+ * A compacted conversation carries a summary in place of the messages it replaced, so the next
+ * compaction must not re-summarize them: it summarizes what came after and merges it into the
+ * summary that is already there. Scanning backward makes the latest anchor win, which is what
+ * the conversation's own order means - an older summary was already merged into the newer one.
+ *
+ * Both anchor kinds are recognized: a `<press-summary>` left by a compaction, and a
+ * `<press-trim>` note left by the trimming path. A message that merely mentions a tag - a caller
+ * note quoting the format, say - is rejected rather than mistaken for a compaction.
+ */
+export function findAnchor(messages: readonly ConversationMessage[]): Anchor | undefined {
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index];
+		if (message?.role !== "assistant") continue;
+
+		const text = textOf(message.content);
+		if (text.length === 0) continue;
+
+		const summary = summaryAnchorText(text);
+		if (summary !== undefined) return { kind: "summary", text: summary, afterIndex: index };
+
+		const trimmed = pressTrimBody(text);
+		if (trimmed !== undefined) return { kind: "trim", text: trimmed, afterIndex: index };
+	}
+	return undefined;
+}
+
+/** The placeholder an old tool result is replaced with. */
+const TRIMMED_TEXT = "[trimmed]";
+
+/**
+ * The shape of a `<press-trim>` anchor's first line: `<n> tool results replaced with [trimmed]`.
+ *
+ * Written by {@link renderPressTrim} and validated by `pressTrimBody`, so the writer and the
+ * parser of the format stay in one file and cannot drift apart.
+ */
+const TRIM_COUNT_LINE = /^\d+ tool results replaced with \[trimmed\]/;
+
+/**
+ * Replace old tool results with a placeholder, keeping every message.
+ *
+ * The token cost of a session sits in its tool results - file reads, command output - and this is
+ * the deterministic way to reclaim it: no model call, no rewriting of what was said. The messages
+ * themselves survive, because a dropped tool result breaks the toolCall -> toolResult chain pi
+ * replays to the provider; only the content becomes `[trimmed]`.
+ *
+ * The same `keep` split as {@link buildSnapshot} applies, and the pass is anchor-aware: messages
+ * up to and including the last anchor are already processed, so only what follows it is a
+ * candidate. Nothing to trim is reported as a note rather than as an empty run, so the caller can
+ * say so without spending anything.
+ */
+export function trimMessages(
+	messages: readonly ConversationMessage[],
+	keep: number | undefined,
+): TrimResult {
+	const total = messages.length;
+	if (total === 0) return { kind: "nothing", note: NO_MESSAGES_NOTE };
+
+	const keptCount = clampKeep(keep, total);
+	const compactedCount = total - keptCount;
+	if (compactedCount === 0) {
+		return {
+			kind: "nothing",
+			note: `Context is already small: keeping the last ${keptCount} of ${total} messages leaves nothing to trim.`,
+		};
+	}
+
+	const compacted = messages.slice(0, compactedCount);
+	const anchor = findAnchor(compacted);
+	// At or before the anchor the run has been through this already; only what follows is new
+	// enough to trim.
+	const first = anchor === undefined ? 0 : anchor.afterIndex + 1;
+
+	let trimmed = 0;
+	const rebuilt = compacted.map((message, index) => {
+		if (index < first || message.role !== "toolResult") return message;
+		trimmed += 1;
+		return { ...message, content: [{ type: "text", text: TRIMMED_TEXT }] };
+	});
+
+	if (trimmed === 0) return { kind: "nothing", note: "No tool results to trim." };
+
+	return {
+		kind: "trimmed",
+		messages: [...rebuilt, ...messages.slice(compactedCount)],
+		trimmed,
+		kept: keptCount,
+	};
+}
+
+/**
+ * The `<press-trim>` message a trim leaves behind.
+ *
+ * It is the only record of the trim that survives into later turns, so it states what was
+ * replaced, which files the trimmed run had been working on - read back out of the tool calls,
+ * because a model listing them from memory is how a file goes missing - and the caller's note.
+ * The note is appended here, outside anything the model controls, so a note that mattered is
+ * not paraphrased away by the next compaction. Its first line is {@link TRIM_COUNT_LINE}'s
+ * shape, which is what lets `pressTrimBody` tell a real trim from prose about one.
+ */
+export function renderPressTrim(
+	trimmed: number,
+	referencedFiles: readonly string[],
+	note: string | undefined,
+): SummaryMessage {
+	const lines = [`${trimmed} tool results replaced with [trimmed].`];
+	if (referencedFiles.length > 0) {
+		lines.push(`Recently referenced files: ${referencedFiles.join(", ")}.`);
+	}
+	const trimmedNote = note?.trim();
+	if (trimmedNote) lines.push(`Note: ${trimmedNote}`);
+
+	return {
+		role: "assistant",
+		content: [{ type: "text", text: `<press-trim>\n${lines.join("\n")}\n</press-trim>` }],
+		timestamp: Date.now(),
+	};
+}
+
+/** Tools whose call names a file, and the arguments that carry it. */
+const FILE_TOOLS = new Set(["read", "edit", "write", "resolve_file", "summary", "related_files"]);
+
+/**
+ * The files a run's tool calls named, deduplicated, in first-seen order.
+ *
+ * A summary that lists the files in play saves the next turn a search, but the model writes that
+ * list from memory. Reading the paths back out of the tool calls records what was actually
+ * touched. First-seen order is kept because it follows the work: the file opened first is usually
+ * the one the task started from, and a sorted list would hide that.
+ */
+export function extractFilePaths(messages: readonly ConversationMessage[]): string[] {
+	const paths: string[] = [];
+	const seen = new Set<string>();
+
+	for (const message of messages) {
+		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+
+		for (const part of message.content) {
+			if (typeof part !== "object" || part === null) continue;
+			const call = part as { type?: unknown; name?: unknown; arguments?: unknown };
+			if (call.type !== "toolCall" || typeof call.name !== "string") continue;
+			if (!FILE_TOOLS.has(call.name)) continue;
+			if (typeof call.arguments !== "object" || call.arguments === null) continue;
+
+			const { path, pattern } = call.arguments as { path?: unknown; pattern?: unknown };
+			const named = typeof path === "string" ? path : pattern;
+			if (typeof named !== "string") continue;
+
+			const trimmed = named.trim();
+			if (trimmed.length === 0 || seen.has(trimmed)) continue;
+			seen.add(trimmed);
+			paths.push(trimmed);
+		}
+	}
+
+	return paths;
+}
+
+/**
  * Compact the conversation through one model call.
  *
  * Returns the replacement message, the parsed sections and the kept tail; `skipped` when
  * the snapshot found nothing to compact. Every other failure - unusable model, provider
  * error, unusable answer - raises a {@link PressError} for the caller to report.
+ *
+ * A conversation that already carries a summary is continued rather than restarted: only the
+ * messages after the last {@link findAnchor} anchor are summarized, and the prompt hands the model
+ * its own earlier summary to merge them into. The replacement message still covers the whole
+ * compacted run, so the rebuilt context is the same shape either way.
  */
 export async function compactContext(
 	ctx: CompactionContext,
@@ -164,18 +353,40 @@ export async function compactContext(
 	const snapshot = buildSnapshot(messages, keep);
 	if (snapshot.kind === "nothing") return { kind: "skipped", note: snapshot.note };
 
+	// The compacted run is the leading slice `buildSnapshot` counted; the tail it kept follows.
+	const compactedRun = messages.slice(0, snapshot.compacted);
+	const anchor = findAnchor(compactedRun);
+	const fresh = anchor === undefined ? compactedRun : compactedRun.slice(anchor.afterIndex + 1);
+	if (fresh.length === 0) {
+		return {
+			kind: "skipped",
+			note: "Already compacted up to the last anchor: nothing new to summarize.",
+		};
+	}
+
 	const model = resolveCompactionModel(ctx, settings);
-	const prompt = buildPrompt(snapshot.text, snapshot.compacted, snapshot.kept.length, note);
+	const prompt = buildPrompt(
+		fresh.map(renderMessage).join("\n\n"),
+		fresh.length,
+		snapshot.kept.length,
+		anchor,
+	);
 	const summary = parsePressSummary(await requestSummary(ctx, model, prompt));
+	// Read over the whole compacted run, not just the new messages: the files named before the
+	// anchor are still the ones the merged summary describes.
+	const files = extractFilePaths(compactedRun);
 
 	return {
 		kind: "compacted",
 		message: {
 			role: "assistant",
-			content: [{ type: "text", text: appendNote(renderPressSummary(summary), note) }],
+			content: [
+				{ type: "text", text: appendNote(renderPressSummary(summary, files), note) },
+			],
 			timestamp: Date.now(),
 		},
 		kept: snapshot.kept,
+		// The replacement message stands in for the whole run, anchor included.
 		compacted: snapshot.compacted,
 	};
 }
@@ -285,21 +496,34 @@ function describeModel(model: unknown): string {
 	return "the session model";
 }
 
-/** The prompt: continuation framing, structured sections, and the conversation itself. */
+/**
+ * The prompt: continuation framing, structured sections, and the conversation itself.
+ *
+ * The caller's note is deliberately absent. A note is the caller's message to the next turn,
+ * appended to the summary verbatim by {@link appendNote}; a model shown it would fold it into the
+ * summary and reword it, which is exactly what it must not do. What the caller wants preserved
+ * reaches the summary through the conversation itself.
+ *
+ * An anchor is what the fresh messages are merged into, so the prompt says which kind it is: the
+ * model's own earlier summary, or a trim note describing what was cut.
+ */
 function buildPrompt(
 	snapshot: string,
 	compacted: number,
 	kept: number,
-	note: string | undefined,
+	anchor?: Anchor,
 ): string {
-	const noteBlock = note
-		? `\nThe caller asked you to preserve this in particular:\n${note}\n`
-		: "";
+	const anchorBlock = anchor === undefined ? "" : `${anchorIntro(anchor)}\n\n${anchor.text}\n\n`;
+	const counts =
+		anchor === undefined
+			? `The ${compacted} messages below are replaced by your answer; the last ${kept} messages are preserved verbatim after it.`
+			: `Merge the ${compacted} messages below into the block above; together they replace everything before the last ${kept} messages, which are preserved verbatim after it.`;
+	const header = anchor === undefined ? "Conversation to compact" : "New messages to merge";
 
 	return `Write a continuation summary that will allow you (or another instance of yourself) to resume work efficiently.
 
-The ${compacted} messages below are replaced by your answer; the last ${kept} messages are preserved verbatim after it.
-${noteBlock}
+${anchorBlock}${counts}
+
 Err on the side of including information that would prevent duplicate work or repeated mistakes.
 
 Answer with exactly one <press-summary> block and nothing else:
@@ -317,12 +541,23 @@ Answer with exactly one <press-summary> block and nothing else:
 <file paths, user constraints, conventions, anything else the next turn needs>
 </press-summary>
 
-Conversation to compact (${compacted} messages):
+${header} (${compacted} messages):
 
 ${snapshot}`;
 }
 
-/**
+/** One sentence telling the model what the block it is about to read is. */
+function anchorIntro(anchor: Anchor): string {
+	if (anchor.kind === "summary") {
+		return `Below is your existing summary for this conversation. Merge the new messages into it: preserve what is still relevant, remove what is superseded or resolved.
+
+Existing summary:`;
+	}
+	return `The conversation was previously trimmed; the note below describes what was removed. Summarize only the new messages.
+
+Trim note:`;
+}
+
 /**
  * The five sections the prompt asks for, in the order they are rendered.
  *
@@ -398,6 +633,37 @@ function pressSummaryBody(raw: string): string {
 }
 
 /**
+ * The body of a `<press-summary>` anchor, or undefined when the text is not one.
+ *
+ * Finding the tag is not enough: a caller note that quotes the format, or an assistant turn
+ * discussing it, would read as a compaction. Section headings are what a summary actually is, so
+ * the body is run through the parser's own recognition table ({@link headingKey}) and a block
+ * with no recognized heading is rejected.
+ */
+function summaryAnchorText(raw: string): string | undefined {
+	if (!/<press-summary>/i.test(raw)) return undefined;
+	const body = pressSummaryBody(raw);
+	return body.split("\n").some((line) => headingKey(line) !== undefined) ? body : undefined;
+}
+
+/**
+ * The inside of a `<press-trim>` block, or undefined when the text is not one.
+ *
+ * The tag alone is not the signal: an assistant turn discussing the trim format would read as
+ * a trim just as a note quoting `<press-summary>` would read as a summary. What every real trim
+ * opens with is {@link renderPressTrim}'s count line, so the body must start with one - prose
+ * about a trim never does. An unclosed tail is still accepted, because a trim message truncated
+ * by a token limit still says what was removed.
+ */
+function pressTrimBody(raw: string): string | undefined {
+	const closed = /<press-trim>([\s\S]*?)<\/press-trim>/i.exec(raw);
+	const body = closed?.[1] ?? /<press-trim>([\s\S]*)/i.exec(raw)?.[1];
+	if (body === undefined) return undefined;
+	const trimmedBody = body.trim();
+	return TRIM_COUNT_LINE.test(trimmedBody) ? trimmedBody : undefined;
+}
+
+/**
  * Split a block body on its section headings.
  *
  * preamble is the text before the first recognized heading, and sections that came back
@@ -443,14 +709,33 @@ function splitSections(block: string): {
  * Sections that came back empty are dropped rather than filled with a placeholder: the
  * model that follows will not read "(none)" as information.  Task Overview is always
  * rendered because it is the primary section.
+ *
+ * `referencedFiles` is the list of paths the run's tool calls named, appended to Context to
+ * Preserve. It is a fact about the conversation, not something to ask the model to remember, so it
+ * is rendered here; it lands inside the section, where the parser reads it back like any other line.
  */
-export function renderPressSummary(ps: PressSummary): string {
+export function renderPressSummary(ps: PressSummary, referencedFiles?: readonly string[]): string {
 	const parts = [`## Task Overview\n${ps.taskOverview}`];
 	if (ps.currentState) parts.push(`## Current State\n${ps.currentState}`);
 	if (ps.discoveries) parts.push(`## Important Discoveries\n${ps.discoveries}`);
 	if (ps.nextSteps) parts.push(`## Next Steps\n${ps.nextSteps}`);
-	if (ps.context) parts.push(`## Context to Preserve\n${ps.context}`);
+
+	const context = withReferencedFiles(ps.context, referencedFiles);
+	if (context) parts.push(`## Context to Preserve\n${context}`);
 	return `<press-summary>\n${parts.join("\n\n")}\n</press-summary>`;
+}
+
+/**
+ * The Context to Preserve body with the referenced files appended.
+ *
+ * The list is appended after whatever the model wrote, and it is the whole body when the model left
+ * the section empty - the same "non-empty sections only" rule as the sections themselves, so a list
+ * with nothing in it adds nothing.
+ */
+function withReferencedFiles(context: string, files: readonly string[] | undefined): string {
+	if (files === undefined || files.length === 0) return context;
+	const list = `Recently referenced files:\n${files.map((file) => `- ${file}`).join("\n")}`;
+	return context ? `${context}\n\n${list}` : list;
 }
 
 /**
@@ -462,8 +747,8 @@ export function renderPressSummary(ps: PressSummary): string {
  * is added to the message outside the model's control, and `renderPressSummary` stays the pure
  * renderer of what the model produced.
  *
- * The note still reaches the prompt as well: there it tells the model what to preserve, and
- * here it tells the next turn what happened.
+ * The note reaches nothing else: it is the caller's message to the next turn, not an instruction to
+ * the compaction model, which would fold the wording into the summary it writes.
  */
 function appendNote(block: string, note: string | undefined): string {
 	const trimmed = note?.trim();
