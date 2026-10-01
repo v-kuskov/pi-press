@@ -21,6 +21,8 @@ import {
 } from "./src/config.ts";
 import {
 	cacheMessages,
+	cachedMessagesSnapshot,
+	stageCompactedContext,
 	stagedCompactedContext,
 	takeStagedCompactedContext,
 } from "./src/state.ts";
@@ -71,7 +73,7 @@ const DEFAULTS = { warnTokens: DEFAULT_WARN_TOKENS, forceTokens: DEFAULT_FORCE_T
 
 // ------------------------------------------------------------------ factory
 
-await check("the factory registers the press tool synchronously", async () => {
+await check("the factory registers the press tool and the context hook synchronously", async () => {
 	const tools = [];
 	const handlers = [];
 	const factory = extensionFactory;
@@ -84,7 +86,7 @@ await check("the factory registers the press tool synchronously", async () => {
 	});
 
 	assert.equal(result, undefined, "the factory is synchronous");
-	assert.deepEqual(handlers, [], "no hook is registered until ticket 04");
+	assert.deepEqual(handlers, ["context"], "the context hook is the only hook registered");
 	assert.deepEqual(
 		tools.map((tool) => tool.name),
 		["press"],
@@ -683,6 +685,235 @@ await check("a compaction model failure reaches the model as an error result", a
 		);
 		assert.equal(thrown.isError, true);
 		assert.match(thrown.content[0].text, /Compaction failed: socket closed/);
+	} finally {
+		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// -------------------------------------------------------------- context hook
+
+/** Capture the handler the factory registers for the `context` event. */
+function contextHook() {
+	const handlers = [];
+	extensionFactory({
+		registerTool: () => {},
+		on: (event, handler) => handlers.push({ event, handler }),
+	});
+	assert.deepEqual(
+		handlers.map((entry) => entry.event),
+		["context"],
+		"exactly one context handler is registered",
+	);
+	return handlers[0].handler;
+}
+
+/** The hook's `ctx`: only context usage and a cwd are read from it. */
+function hookCtx(tokens, cwd = tmpdir()) {
+	return {
+		cwd,
+		getContextUsage: () =>
+			tokens === undefined ? undefined : { tokens, contextWindow: 1_000_000, percent: 0.5 },
+	};
+}
+
+/** A pass over `messages`, as pi's runner would emit it. */
+function contextPass(handler, messages, tokens, cwd) {
+	return handler({ type: "context", messages }, hookCtx(tokens, cwd));
+}
+
+/** An assistant turn that ends by requesting a tool: mid-turn, never a compaction point. */
+function assistantToolCall(name = "read") {
+	return {
+		role: "assistant",
+		content: [{ type: "toolCall", id: `call-${name}`, name, arguments: {} }],
+		timestamp: 1,
+	};
+}
+
+await check("the context hook caches the conversation for the press tool", async () => {
+	resetSettings();
+	const handler = contextHook();
+	const messages = [user("one"), assistant("two")];
+	try {
+		cacheMessages([]);
+		const result = await contextPass(handler, messages, DEFAULT_WARN_TOKENS - 1, tempProject());
+
+		assert.equal(result, undefined, "a quiet pass rewrites nothing");
+		assert.equal(cachedMessagesSnapshot(), messages, "the tool reads back the messages pi handed over");
+	} finally {
+		cacheMessages([]);
+	}
+});
+
+await check("token pressure at the threshold warns the model once", async () => {
+	resetSettings();
+	const root = tempProject();
+	const handler = contextHook();
+	const messages = [user("one"), assistant("two")];
+	try {
+		cacheMessages([]);
+		const result = await contextPass(handler, messages, DEFAULT_WARN_TOKENS, root);
+
+		assert.equal(result.messages.length, messages.length + 1, "the warning is appended, not substituted");
+		assert.deepEqual(
+			result.messages.slice(0, messages.length),
+			messages,
+			"the conversation itself is untouched",
+		);
+		const warning = result.messages.at(-1);
+		assert.equal(warning.role, "system", "the warning must be a system message");
+		assert.equal(typeof warning.timestamp, "number");
+		assert.match(warning.content[0].text, /press/, "it names the tool to call");
+		assert.ok(
+			warning.content[0].text.includes(String(DEFAULT_WARN_TOKENS)),
+			"it states the threshold",
+		);
+		assert.deepEqual(
+			cachedMessagesSnapshot(),
+			messages,
+			"our own warning is not cached, so press never summarizes it",
+		);
+	} finally {
+		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the warning honours the configured threshold", async () => {
+	resetSettings();
+	const root = tempProject();
+	const handler = contextHook();
+	const messages = [user("one"), assistant("two")];
+	try {
+		writeScope(root, "project", { [SETTINGS_KEY]: { warnTokens: 100 } });
+		cacheMessages([]);
+
+		const below = await contextPass(handler, messages, 99, root);
+		assert.equal(below, undefined, "below the configured threshold nothing happens");
+
+		const above = await contextPass(handler, messages, 100, root);
+		assert.equal(above.messages.length, messages.length + 1, "the configured threshold warns");
+		assert.match(above.messages.at(-1).content[0].text, /100/, "the warning quotes it");
+	} finally {
+		cacheMessages([]);
+		resetSettings();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("token pressure is only checked at an assistant text turn boundary", async () => {
+	resetSettings();
+	const handler = contextHook();
+	const root = tempProject();
+	try {
+		cacheMessages([]);
+
+		// Tool results and in-flight tool calls are mid-turn: the compaction points are wrong
+		// there, and acting would rewrite the conversation around results still arriving.
+		const afterToolResult = [user("one"), assistantToolCall(), toolResult("read", "contents")];
+		assert.equal(
+			await contextPass(handler, afterToolResult, DEFAULT_FORCE_TOKENS, root),
+			undefined,
+			"a trailing tool result does not warn",
+		);
+
+		const awaitingTool = [user("one"), assistant("two"), assistantToolCall()];
+		assert.equal(
+			await contextPass(handler, awaitingTool, DEFAULT_FORCE_TOKENS, root),
+			undefined,
+			"an assistant message that requests a tool does not warn",
+		);
+
+		// Same messages, same hook: at a real boundary the warning does fire, so the cases above
+		// prove the shape check and not a broken threshold.
+		const boundary = [user("one"), assistant("two")];
+		const warned = await contextPass(handler, boundary, DEFAULT_FORCE_TOKENS, root);
+		assert.equal(warned.messages.length, boundary.length + 1, "an assistant text turn does warn");
+	} finally {
+		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the warning is injected once while the flag is set", async () => {
+	resetSettings();
+	const handler = contextHook();
+	const root = tempProject();
+	const messages = [user("one"), assistant("two")];
+	try {
+		cacheMessages([]);
+		const first = await contextPass(handler, messages, DEFAULT_WARN_TOKENS, root);
+		assert.equal(first.messages.length, messages.length + 1, "the first crossing warns");
+
+		const second = await contextPass(handler, messages, DEFAULT_WARN_TOKENS + 1000, root);
+		assert.equal(second, undefined, "further pressure while warned adds nothing");
+
+		const third = await contextPass(handler, messages, DEFAULT_FORCE_TOKENS, root);
+		assert.equal(third, undefined, "raising pressure does not re-inject the warning");
+	} finally {
+		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("unknown token usage leaves the context alone", async () => {
+	resetSettings();
+	const handler = contextHook();
+	const messages = [user("one"), assistant("two")];
+	try {
+		cacheMessages([]);
+		assert.equal(await contextPass(handler, messages, undefined), undefined, "no usage means no check");
+		assert.equal(
+			await contextPass(handler, messages, null),
+			undefined,
+			"usage that pi reports as unknown does not warn",
+		);
+	} finally {
+		cacheMessages([]);
+	}
+});
+
+await check("a staged compaction replaces the conversation", async () => {
+	resetSettings();
+	const handler = contextHook();
+	const messages = [user("one"), assistant("two")];
+	const summary = { role: "assistant", content: [{ type: "text", text: "<press-summary>\n## Summary\ndid the work\n</press-summary>" }], timestamp: 9 };
+	const kept = user("three");
+	try {
+		cacheMessages([]);
+		stageCompactedContext([summary, kept]);
+
+		// Consumption is checked above any threshold: a staged compaction from a manual `press`
+		// must not also draw a warning about the pressure it just relieved.
+		const result = await contextPass(handler, messages, DEFAULT_FORCE_TOKENS, tmpdir());
+		assert.deepEqual(result.messages, [summary, kept], "the summary and the kept tail stand in");
+		assert.equal(stagedCompactedContext(), undefined, "a staged context is consumed exactly once");
+		assert.equal(takeStagedCompactedContext(), undefined, "and is gone afterwards");
+	} finally {
+		cacheMessages([]);
+	}
+});
+
+await check("a compaction clears the warning flag", async () => {
+	resetSettings();
+	const handler = contextHook();
+	const root = tempProject();
+	const before = [user("one"), assistant("two")];
+	const summary = { role: "assistant", content: [{ type: "text", text: "<press-summary>\n## Summary\ndid the work\n</press-summary>" }], timestamp: 9 };
+	try {
+		cacheMessages([]);
+		const first = await contextPass(handler, before, DEFAULT_WARN_TOKENS, root);
+		assert.equal(first.messages.length, before.length + 1, "pressure warns before the compaction");
+
+		stageCompactedContext([summary]);
+		const compacted = await contextPass(handler, before, DEFAULT_WARN_TOKENS, root);
+		assert.deepEqual(compacted.messages, [summary], "the compaction is installed instead");
+
+		// The flag cleared with the compaction, so pressure building again gets its own warning.
+		const after = [summary, user("four"), assistant("five")];
+		const second = await contextPass(handler, after, DEFAULT_WARN_TOKENS, root);
+		assert.equal(second.messages.length, after.length + 1, "the next crossing warns again");
 	} finally {
 		cacheMessages([]);
 		rmSync(root, { recursive: true, force: true });
