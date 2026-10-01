@@ -980,14 +980,25 @@ await check("the press tool declares optional note and keep parameters", async (
 	assert.deepEqual(schema.required ?? [], [], "both parameters are optional");
 });
 
-await check("the press tool injects no prompt snippet of its own", async () => {
-	// Spec: the tool description is enough, and prompt injection is out of scope. The wording
-	// that used to live in promptGuidelines is folded into the description instead.
+await check("the press tool lists itself in the system prompt and gives one standing rule", async () => {
+	// Spec: the description carries the trigger, because a trigger the model cannot observe
+	// ('the context is getting full') is not a trigger. The snippet and the guideline are what
+	// put press in front of the model on every turn instead of only in its tool schemas.
 	const tool = pressTool();
-	assert.equal(tool.promptSnippet, undefined, "no snippet is registered");
-	assert.equal(tool.promptGuidelines, undefined, "no guidelines are registered");
-	assert.match(tool.description, /start over/, "the guidance survives in the description");
-	assert.match(tool.description, /keep/, "and so does what `keep` is for");
+
+	assert.equal(typeof tool.promptSnippet, "string", "a snippet is registered");
+	assert.ok(
+		!/\n/.test(tool.promptSnippet),
+		"the snippet is one line, which is all the tool section keeps",
+	);
+	assert.equal(tool.promptGuidelines.length, 1, "one guideline, not a set of restatements");
+	assert.match(
+		tool.promptGuidelines[0],
+		/press/,
+		"the guideline says which tool to call rather than describing compaction",
+	);
+	assert.match(tool.description, /trim/, "press points at trim as the free alternative");
+	assert.match(tool.description, /keep/, "and says what `keep` is for");
 });
 
 await check("press compacts the cached messages and hands the model the summary", async () => {
@@ -1171,22 +1182,27 @@ await check("the trim tool declares optional note and keep parameters", async ()
 	assert.deepEqual(schema.required ?? [], [], "both parameters are optional");
 });
 
-await check("both tools declare no prompt snippet and no mode parameter", async () => {
+await check("both tools declare a snippet and a guideline, and neither takes a mode parameter", async () => {
 	const press = pressTool();
 	const tool = trimTool();
 
 	for (const definition of [press, tool]) {
-		assert.equal(definition.promptSnippet, undefined, "no snippet is registered");
-		assert.equal(definition.promptGuidelines, undefined, "no guidelines are registered");
+		assert.equal(typeof definition.promptSnippet, "string", "a snippet is registered");
+		assert.equal(definition.promptGuidelines.length, 1, "exactly one guideline is registered");
 		assert.ok(
 			!("mode" in definition.parameters.properties),
 			"press and trim stay separate tools rather than one with a mode parameter",
 		);
 	}
 
-	assert.match(press.description, /trim/, "press points at trim as the cheap alternative");
+	assert.match(press.description, /trim/, "press points at trim as the free alternative");
 	assert.match(tool.description, /press/, "trim points back at press for a full summary");
 	assert.match(tool.description, /no model call/, "the description says why trim is cheap");
+	assert.match(
+		tool.description,
+		/tool results/,
+		"and what trim actually removes, which is the observable trigger",
+	);
 });
 
 await check("trim replaces old tool results and stages an anchor plus the trimmed run", async () => {
@@ -1695,8 +1711,11 @@ await check("the critical threshold injects the urgent warning and spends no mod
 		assert.match(warning.content[0].text, /critically/i, "it says how bad it is");
 		assert.ok(warning.content[0].text.includes(String(DEFAULT_CRITICAL_TOKENS)), "it states the tokens");
 		assert.match(warning.content[0].text, /50%/, "and the share of the window in use");
-		assert.match(warning.content[0].text, /press/, "it names press");
-		assert.match(warning.content[0].text, /trim/, "and the cheap tool as well");
+		assert.match(warning.content[0].text, /trim/, "and the free one as well");
+		assert.ok(
+			warning.content[0].text.indexOf("trim") < warning.content[0].text.indexOf("press"),
+			"it asks for the free move first, so acting on it costs no model call",
+		);
 		assert.deepEqual(
 			hook.press.cachedMessages(),
 			messages,
@@ -1719,6 +1738,10 @@ await check("both tools are named in the regular warning text", async () => {
 		assert.match(text, /press/, "the warning names press");
 		assert.match(text, /trim/, "and trim, the tool that needs no model call");
 		assert.match(text, /\[trimmed\]/, "saying what trim actually does to the conversation");
+		assert.ok(
+			text.indexOf("trim") < text.indexOf("press"),
+			"the free move is the first thing the warning asks for",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

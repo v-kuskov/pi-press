@@ -14,12 +14,14 @@ type AgentMessage = ContextEvent["messages"][number];
 /**
  * Warning text handed to the model when the context crosses the warning threshold.
  *
- * It names both tools and their parameters, because the model reading it has to act on it in
- * one step: nothing else will tell it what `press` and `trim` accept, or which of the two the
- * situation calls for.
+ * It leads with `trim` because that is the move the model can make in one step at no cost: an
+ * instruction the model can carry out right now beats one it has to weigh against a model call,
+ * and the pressure often goes away without a summary. `press` follows for the case trimming
+ * cannot cover. Both are named with their parameters, because this message is the model's only
+ * prompt-side reminder of what they accept.
  */
 export function warningText(tokens: number, warnTokens: number): string {
-	return `Context usage is at ${tokens} tokens, past the ${warnTokens}-token warning threshold. Call the press tool to compact the conversation into a summary before the context degrades: pass note describing what matters most to preserve, and keep for how many recent messages to leave verbatim. If only tokens need freeing and the conversation is still worth keeping, call trim instead: it replaces old tool results with [trimmed] and costs no model call.`;
+	return `Context is at ${tokens} tokens, past the ${warnTokens}-token warning threshold. Call trim now: it replaces old tool results with [trimmed] and costs no model call, and the raw output you have finished with is where the tokens went. Call press instead when the conversation itself should become a summary - pass note for what matters most to preserve, and keep for how many recent messages to leave verbatim.`;
 }
 
 /** The synthetic message appended to the conversation to carry the warning. */
@@ -34,12 +36,13 @@ export function warningMessage(tokens: number, warnTokens: number): AgentMessage
 /**
  * Warning text handed to the model when context usage reaches the critical threshold.
  *
- * The regular warning says the context is filling up; this one says the next step is already
- * degrading. It names both tools for the same reason, and it is phrased as an instruction
- * rather than a status, because the model has to act within one step for it to matter.
+ * The regular warning says the context is filling; this one says the next step is already
+ * degrading. It still leads with `trim`, the move that buys headroom before anything else runs,
+ * and names `press` for the conversation that has become a summary rather than a working set.
+ * Phrased as an instruction rather than a status, because acting within one step is the point.
  */
 export function criticalWarningText(tokens: number, percent: number): string {
-	return `Context is critically large: ${tokens} tokens, ${percent}% of the window. The next steps will degrade unless you act now. Call press for a structured summary, or trim to drop old tool results without a model call.`;
+	return `Context is critically large: ${tokens} tokens, ${percent}% of the window, and the next steps will degrade unless you act now. Call trim to drop old tool results with [trimmed] before your next step - it costs no model call. Call press when the conversation itself should become a summary.`;
 }
 
 /** The synthetic message appended to the conversation to carry the critical warning. */

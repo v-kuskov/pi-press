@@ -53,7 +53,13 @@ export function registerPressTool(pi: ExtensionAPI, state: PressState): void {
 		name: "press",
 		label: "Compact context",
 		description:
-			"Compact the conversation so far into a summary, keeping the most recent messages verbatim. Call it when the context is getting full and you want to keep working on the same task, instead of asking the user to start over. Pass note describing what matters most to preserve, and raise keep when you are mid-way through a multi-step task. When only tokens need freeing and the conversation itself is still worth keeping, call trim instead: it costs no model call.",
+			"Compact the conversation so far into a <press-summary> block, keeping the most recent messages verbatim. Call press when the conversation itself should become a summary: a finished phase of work, a long multi-step task still running, or a session that would otherwise have to start over. It spends one model call, so when freeing tokens is all you need, trim does that for free. Pass note saying what matters most to preserve, and raise keep when you are mid-way through a multi-step task.",
+		// A tool without a snippet is left out of the system prompt's tool section, which is the
+		// difference between a tool the model remembers and one it has to rediscover each turn.
+		promptSnippet: "Compact a long conversation into a summary and keep working in the same session",
+		promptGuidelines: [
+			"Call press before starting a new phase of work once the finished phase fills the context: summarize what it decided, carry the plan forward through note, and continue in this session.",
+		],
 		parameters,
 		// Compaction rewrites the conversation, so it must not overlap with other tool calls.
 		executionMode: "sequential",

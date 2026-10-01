@@ -56,7 +56,13 @@ export function registerTrimTool(pi: ExtensionAPI, state: PressState): void {
 		name: "trim",
 		label: "Trim context",
 		description:
-			"Trim the conversation by replacing old tool results with [trimmed] placeholders, keeping your own messages and the most recent ones verbatim. It costs no model call, so call it when tokens need freeing right now: it is the fast alternative to press, which spends a call to compact the conversation into a full structured summary. Pass keep to leave more recent messages untouched, and note to leave yourself a line in the trimmed context.",
+			"Trim the conversation by replacing old tool results with [trimmed] placeholders, keeping your own messages and the most recent ones verbatim. It spends no model call and never loses your own reasoning, so reach for it whenever the context is carrying raw output you have finished with: long file reads, search results, test and build logs. Pass keep to leave more recent messages untouched, and note to leave yourself a line in the trimmed context. Call press instead when the conversation itself should become a summary.",
+		// A tool without a snippet is left out of the system prompt's tool section, which is the
+		// difference between a tool the model remembers and one it has to rediscover each turn.
+		promptSnippet: "Free context by replacing old tool results with [trimmed] placeholders",
+		promptGuidelines: [
+			"Call trim after any large tool result - a long file read, a search, a test or build log - once you have what you need from it, so the raw output stops costing tokens.",
+		],
 		parameters,
 		// Trimming rewrites the conversation, so it must not overlap with other tool calls.
 		executionMode: "sequential",
