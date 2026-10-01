@@ -1,0 +1,55 @@
+{
+  "name": "pi-press",
+  "version": "0.1.0",
+  "description": "Pi Coding Agent extension — a `press` tool that compacts the conversation through an LLM summary, with token-pressure warnings and forced compaction as safety nets.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "compact",
+    "compaction",
+    "context",
+    "tokens",
+    "press"
+  ],
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit && node smoke.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "node smoke.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.99.2",
+    "@earendil-works/pi-tui": "^0.99.2",
+    "@types/node": "^24.0.0",
+    "typebox": "^1.3.30",
+    "typescript": "^5.9.3"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "src/"
+  ],
+  "engines": {
+    "node": ">=24"
+  }
+}
