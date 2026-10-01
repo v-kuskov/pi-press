@@ -19,6 +19,11 @@ import {
 	readPressSettings,
 	SETTINGS_KEY,
 } from "./src/config.ts";
+import {
+	cacheMessages,
+	stagedCompactedContext,
+	takeStagedCompactedContext,
+} from "./src/state.ts";
 
 /**
  * Isolation from the developer's own pi install.
@@ -66,7 +71,7 @@ const DEFAULTS = { warnTokens: DEFAULT_WARN_TOKENS, forceTokens: DEFAULT_FORCE_T
 
 // ------------------------------------------------------------------ factory
 
-await check("the factory registers nothing and starts nothing yet", async () => {
+await check("the factory registers the press tool synchronously", async () => {
 	const tools = [];
 	const handlers = [];
 	const factory = extensionFactory;
@@ -74,13 +79,18 @@ await check("the factory registers nothing and starts nothing yet", async () => 
 	// A factory that returned a promise, spawned a timer, or opened a handle would keep the
 	// event loop busy after load; the load path in pi must stay synchronous.
 	const result = factory({
-		registerTool: (def) => tools.push(def.name),
+		registerTool: (definition) => tools.push(definition),
 		on: (event) => handlers.push(event),
 	});
 
 	assert.equal(result, undefined, "the factory is synchronous");
-	assert.deepEqual(tools, [], "no tool is registered in ticket 01");
-	assert.deepEqual(handlers, [], "no hook is registered in ticket 01");
+	assert.deepEqual(handlers, [], "no hook is registered until ticket 04");
+	assert.deepEqual(
+		tools.map((tool) => tool.name),
+		["press"],
+		"the press tool is the only tool registered",
+	);
+	assert.equal(typeof tools[0].execute, "function", "the tool is executable");
 });
 
 // ------------------------------------------------------------------ config
@@ -520,6 +530,163 @@ await check("a summary split across text blocks is parsed as one answer", async 
 		"<press-summary>\n## Summary\nhalf \na summary\n\n## Notes\nthe note\n</press-summary>",
 	);
 	assert.equal(calls.length, 1);
+});
+
+// ---------------------------------------------------------------- press tool
+
+/** The definition the extension hands to pi, captured through a fake registry. */
+function pressTool() {
+	const tools = [];
+	extensionFactory({ registerTool: (definition) => tools.push(definition), on: () => {} });
+	assert.equal(tools.length, 1, "exactly one tool is registered");
+	return tools[0];
+}
+
+/** The tool executor's fifth argument: the engine's fake ctx plus a working directory. */
+function toolCtx(fake, cwd) {
+	return { ...fake.ctx, cwd };
+}
+
+await check("the press tool declares optional note and keep parameters", async () => {
+	const tool = pressTool();
+	assert.equal(tool.name, "press");
+	assert.equal(typeof tool.label, "string");
+	assert.equal(typeof tool.description, "string");
+
+	const schema = tool.parameters;
+	assert.deepEqual(Object.keys(schema.properties).sort(), ["keep", "note"]);
+	assert.equal(schema.properties.note.type, "string");
+	assert.equal(schema.properties.keep.type, "integer");
+	assert.equal(schema.properties.keep.default, 1, "keep defaults to the last message only");
+	assert.deepEqual(schema.required ?? [], [], "both parameters are optional");
+});
+
+await check("press compacts the cached messages and hands the model the summary", async () => {
+	resetSettings();
+	const root = tempProject();
+	try {
+		const compactionModel = { provider: "routerai", id: "compactor" };
+		const { ctx, calls } = fakeCtx({
+			respond: () => OK,
+			known: { "routerai/compactor": compactionModel },
+		});
+		writeScope(root, "project", { [SETTINGS_KEY]: { model: "routerai/compactor" } });
+
+		const messages = [user("one"), assistant("two"), user("three")];
+		cacheMessages(messages);
+
+		const result = await pressTool().execute(
+			"call-1",
+			{ note: "keep the migration plan", keep: 1 },
+			undefined,
+			undefined,
+			toolCtx({ ctx }, root),
+		);
+
+		assert.notEqual(result.isError, true, "a successful press is not an error result");
+		assert.match(result.content[0].text, /^<press-summary>/, "the model sees the summary block");
+		assert.match(result.content[0].text, /did the work/);
+		assert.equal(result.details.status, "compacted");
+		assert.equal(result.details.compacted, 2);
+		assert.equal(result.details.kept, 1);
+		assert.equal(calls.length, 1, "one summary call is spent");
+		assert.ok(
+			calls[0].context.messages[0].content[0].text.includes("keep the migration plan"),
+			"the note reaches the compaction prompt",
+		);
+
+		// The handoff tickets 04/05 consume: the summary message, then the untouched tail.
+		const staged = takeStagedCompactedContext();
+		assert.equal(staged.length, 2);
+		assert.equal(staged[0].content[0].text, result.content[0].text, "the staged block is what the model saw");
+		assert.deepEqual(staged[1], messages[2], "the kept message is unstaged verbatim");
+		assert.equal(stagedCompactedContext(), undefined, "the staged context is held, not read twice");
+		assert.equal(takeStagedCompactedContext(), undefined, "taking the staged context once is enough");
+	} finally {
+		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("press reports an error when nothing has been cached yet", async () => {
+	cacheMessages([]);
+	const { ctx, calls } = fakeCtx({ respond: () => OK });
+
+	const result = await pressTool().execute("call-2", {}, undefined, undefined, toolCtx({ ctx }, tmpdir()));
+
+	assert.equal(result.isError, true);
+	assert.equal(result.content[0].text, NO_MESSAGES_NOTE);
+	assert.equal(result.details.status, "error");
+	assert.equal(calls.length, 0, "an empty cache spends no model call");
+	assert.equal(takeStagedCompactedContext(), undefined);
+});
+
+await check("press reports a context that is already small without spending a call", async () => {
+	resetSettings();
+	const root = tempProject();
+	try {
+		cacheMessages([user("one"), assistant("two")]);
+		const { ctx, calls } = fakeCtx({ respond: () => OK });
+
+		const result = await pressTool().execute(
+			"call-3",
+			{ keep: 5 },
+			undefined,
+			undefined,
+			toolCtx({ ctx }, root),
+		);
+
+		assert.notEqual(result.isError, true, "a small context is a normal result, not a failure");
+		assert.match(result.content[0].text, /already small/i);
+		assert.equal(result.details.status, "skipped");
+		assert.equal(calls.length, 0, "nothing to compact means no model call");
+		assert.equal(takeStagedCompactedContext(), undefined, "nothing is staged for the context hook");
+	} finally {
+		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a compaction model failure reaches the model as an error result", async () => {
+	resetSettings();
+	const root = tempProject();
+	try {
+		cacheMessages([user("one"), assistant("two")]);
+
+		const provider = fakeCtx({
+			respond: () => ({ stopReason: "error", errorMessage: "provider exploded", content: [] }),
+		});
+		const failed = await pressTool().execute(
+			"call-4",
+			{},
+			undefined,
+			undefined,
+			toolCtx(provider, root),
+		);
+		assert.equal(failed.isError, true);
+		assert.match(failed.content[0].text, /Compaction failed: provider exploded/);
+		assert.equal(failed.details.status, "error");
+		assert.equal(takeStagedCompactedContext(), undefined, "a failed press stages nothing");
+
+		// A provider client that throws is reported the same way rather than escaping.
+		const throwing = fakeCtx({
+			respond: () => {
+				throw new Error("socket closed");
+			},
+		});
+		const thrown = await pressTool().execute(
+			"call-5",
+			{},
+			undefined,
+			undefined,
+			toolCtx(throwing, root),
+		);
+		assert.equal(thrown.isError, true);
+		assert.match(thrown.content[0].text, /Compaction failed: socket closed/);
+	} finally {
+		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
 });
 
 rmSync(isolatedAgentDir, { recursive: true, force: true });
