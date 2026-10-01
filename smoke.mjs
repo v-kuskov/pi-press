@@ -5,6 +5,15 @@ import assert from "node:assert/strict";
 
 import extensionFactory from "./index.ts";
 import {
+	buildSnapshot,
+	compactContext,
+	DEFAULT_KEEP,
+	NO_MESSAGES_NOTE,
+	parsePressSummary,
+	renderPressSummary,
+	TOOL_RESULT_CHARS,
+} from "./src/compact.ts";
+import {
 	DEFAULT_FORCE_TOKENS,
 	DEFAULT_WARN_TOKENS,
 	readPressSettings,
@@ -188,6 +197,329 @@ await check("a corrupt settings file degrades to defaults instead of throwing", 
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
+});
+
+// ------------------------------------------------------ compaction engine
+
+function assistant(text, extra = {}) {
+	return { role: "assistant", content: [{ type: "text", text }], timestamp: 1, ...extra };
+}
+
+function user(text) {
+	return { role: "user", content: [{ type: "text", text }], timestamp: 1 };
+}
+
+function toolResult(toolName, text) {
+	return { role: "toolResult", toolName, content: [{ type: "text", text }], timestamp: 1 };
+}
+
+/**
+ * A fake ctx for the compaction engine.
+ *
+ * `respond` is the only behaviour a case supplies; the registry records what it was asked
+ * so a case can assert on the model that was chosen and the prompt that was sent.
+ */
+function fakeCtx({ respond, model = { provider: "routerai", id: "session-model" }, known, authed } = {}) {
+	const calls = [];
+	const catalogue = new Map(Object.entries(known ?? {}));
+	const credentials = authed ?? (() => true);
+	return {
+		calls,
+		ctx: {
+			model,
+			modelRegistry: {
+				find: (provider, modelId) => catalogue.get(`${provider}/${modelId}`),
+				hasConfiguredAuth: (candidate) => credentials(candidate),
+				complete: async (chosen, context, options) => {
+					calls.push({ model: chosen, context, options });
+					return respond(chosen, context);
+				},
+			},
+		},
+	};
+}
+
+/** The `<press-summary>` wrapper a well-behaved compaction model returns. */
+function summaryAnswer({ summary = "did the work", files = "src/a.ts", notes = "(none)" } = {}) {
+	return [
+		{
+			type: "text",
+			text: `<press-summary>\n## Summary\n${summary}\n## Files\n${files}\n## Notes\n${notes}\n</press-summary>`,
+		},
+	];
+}
+
+const OK = { stopReason: "stop", usage: {}, content: summaryAnswer() };
+const SETTINGS = { warnTokens: DEFAULT_WARN_TOKENS, forceTokens: DEFAULT_FORCE_TOKENS };
+
+await check("buildSnapshot truncates tool results and keeps assistant text whole", async () => {
+	const long = "x".repeat(500);
+	const messages = [
+		user("read the file"),
+		assistant("I will read it"),
+		toolResult("read", long),
+		assistant("the file says nothing"),
+	];
+
+	const snapshot = buildSnapshot(messages, 1);
+	assert.equal(snapshot.kind, "snapshot");
+	assert.equal(snapshot.compacted, 3, "all but the last message is compacted");
+	assert.deepEqual(snapshot.kept, [messages[3]], "the tail is preserved verbatim");
+
+	const tool = `[Tool: read] → ${"x".repeat(TOOL_RESULT_CHARS)}...`;
+	assert.ok(snapshot.text.includes(tool), `tool result truncated to 200 chars, got: ${snapshot.text}`);
+	assert.ok(!snapshot.text.includes(long), "the full tool result is not in the snapshot");
+	assert.ok(snapshot.text.includes("I will read it"), "assistant text is kept as-is");
+	assert.ok(snapshot.text.includes("read the file"), "user text is kept as-is");
+	assert.equal(TOOL_RESULT_CHARS, 200, "the documented truncation length");
+});
+
+await check("buildSnapshot does not cut a tool result that already fits", async () => {
+	const snapshot = buildSnapshot([toolResult("grep", "no matches")], 0);
+	assert.equal(snapshot.text, "### 0. toolResult grep\n[Tool: grep] → no matches");
+
+	// A fitting result keeps its newlines: the snapshot reports what the tool returned.
+	const multi = buildSnapshot([toolResult("read", "line one\nline two")], 0);
+	assert.ok(multi.text.includes("[Tool: read] → line one\nline two"), multi.text);
+
+	const empty = buildSnapshot([toolResult("bash", "")], 0);
+	assert.ok(empty.text.includes("[Tool: bash] → (no text output)"));
+
+	// An assistant turn that only called tools still names the calls.
+	const calls = buildSnapshot(
+		[
+			{
+				role: "assistant",
+				content: [
+					{ type: "toolCall", name: "read" },
+					{ type: "toolCall", name: "edit" },
+				],
+			},
+		],
+		0,
+	);
+	assert.equal(calls.text, "### 0. assistant\n(called read, edit)");
+});
+
+await check("buildSnapshot clamps keep to the total and reports nothing to compact", async () => {
+	const messages = [user("one"), assistant("two")];
+
+	const over = buildSnapshot(messages, 99);
+	assert.equal(over.kind, "nothing");
+	assert.match(over.note, /already small/i);
+
+	const exact = buildSnapshot(messages, 2);
+	assert.equal(exact.kind, "nothing", "keep equal to the total compacts nothing");
+
+	const empty = buildSnapshot([], 1);
+	assert.equal(empty.kind, "nothing");
+	assert.equal(empty.note, NO_MESSAGES_NOTE);
+
+	// keep 0 and a negative keep both mean "compact everything" rather than an error.
+	assert.equal(buildSnapshot(messages, 0).compacted, 2);
+	assert.equal(buildSnapshot(messages, -5).compacted, 2);
+	assert.equal(buildSnapshot(messages, undefined).compacted, 1, "the default keeps the last message");
+	assert.equal(DEFAULT_KEEP, 1);
+});
+
+await check("compactContext compacts with the configured model and replaces the run", async () => {
+	const compactionModel = { provider: "routerai", id: "compactor" };
+	const { ctx, calls } = fakeCtx({
+		respond: () => OK,
+		known: { "routerai/compactor": compactionModel },
+	});
+	const messages = [user("one"), assistant("two"), user("three"), assistant("four")];
+
+	const result = await compactContext(ctx, messages, 1, "keep the migration plan", {
+		...SETTINGS,
+		model: "routerai/compactor",
+	});
+
+	assert.equal(result.kind, "compacted");
+	assert.deepEqual(calls[0].model, compactionModel, "the configured model is used");
+	assert.equal(calls[0].options.cacheRetention, "none", "a one-shot prompt is not cached");
+
+	const prompt = calls[0].context.messages[0].content[0].text;
+	assert.ok(prompt.includes("keep the migration plan"), "the note reaches the prompt");
+	assert.ok(prompt.includes("### 1. assistant"), "the snapshot reaches the prompt");
+	assert.ok(!prompt.includes("four"), "the kept tail is not part of the snapshot");
+
+	assert.equal(result.message.role, "assistant");
+	assert.equal(result.compacted, 3);
+	assert.deepEqual(result.kept, [messages[3]], "the kept messages ride along for the caller");
+	assert.ok(
+		result.message.content[0].text.startsWith("<press-summary>"),
+		"the replacement is a press-summary block",
+	);
+	assert.equal(result.summary.summary, "did the work", "the parsed sections come back for details");
+});
+
+await check("compactContext falls back to the session model, and skips an empty snapshot", async () => {
+	const session = { provider: "routerai", id: "session-model" };
+	const { ctx, calls } = fakeCtx({ respond: () => OK, model: session });
+
+	const result = await compactContext(ctx, [user("one"), assistant("two")], 1, undefined, SETTINGS);
+	assert.equal(result.kind, "compacted");
+	assert.deepEqual(calls[0].model, session, "the session model is the fallback");
+
+	const skipped = await compactContext(ctx, [user("one")], 5, undefined, SETTINGS);
+	assert.equal(skipped.kind, "skipped");
+	assert.match(skipped.note, /already small/i);
+	assert.equal(calls.length, 1, "a skipped compaction spends no model call");
+});
+
+await check("an unusable compaction model fails loudly rather than spending another one", async () => {
+	const cases = [
+		{ model: "routerai/missing", expected: /names no known model/i },
+		{ model: "not-a-model", expected: /provider\/model form/i },
+		{ model: "routerai/unauthed", expected: /No credentials/i },
+	];
+
+	for (const { model, expected } of cases) {
+		const { ctx, calls } = fakeCtx({
+			respond: () => OK,
+			known: { "routerai/unauthed": { provider: "routerai", id: "unauthed" } },
+			authed: (candidate) => candidate?.id !== "unauthed",
+		});
+		await assert.rejects(
+			() => compactContext(ctx, [user("one"), assistant("two")], 1, undefined, { ...SETTINGS, model }),
+			expected,
+		);
+		assert.equal(calls.length, 0, `${model}: no model call is spent on a bad configuration`);
+	}
+});
+
+await check("an unauthenticated session model is reported, not used", async () => {
+	const { ctx, calls } = fakeCtx({
+		respond: () => OK,
+		model: { provider: "routerai", id: "session-model" },
+		authed: () => false,
+	});
+	await assert.rejects(
+		() => compactContext(ctx, [user("one"), assistant("two")], 1, undefined, SETTINGS),
+		/No credentials configured for routerai\/session-model/,
+	);
+	assert.equal(calls.length, 0);
+});
+
+await check("a provider error surfaces its stop reason, and a throw is reported too", async () => {
+	const failing = fakeCtx({
+		respond: () => ({ stopReason: "error", errorMessage: "rate limited" }),
+	});
+	const error = await compactContext(
+		failing.ctx,
+		[user("one"), assistant("two")],
+		1,
+		undefined,
+		SETTINGS,
+	).then(
+		() => undefined,
+		(caught) => caught,
+	);
+	assert.ok(error, "a provider error rejects");
+	assert.equal(error.name, "PressError");
+	assert.equal(error.stopReason, "error", "the stop reason rides on the error");
+	assert.equal(error.providerMessage, "rate limited");
+	assert.match(error.message, /rate limited/);
+
+	const throwing = fakeCtx({
+		respond: () => {
+			throw new Error("socket closed");
+		},
+	});
+	await assert.rejects(
+		() =>
+			compactContext(throwing.ctx, [user("one"), assistant("two")], 1, undefined, SETTINGS),
+		/socket closed/,
+	);
+
+	const silent = fakeCtx({ respond: () => ({ stopReason: "stop", content: [] }) });
+	await assert.rejects(
+		() => compactContext(silent.ctx, [user("one"), assistant("two")], 1, undefined, SETTINGS),
+		/returned no text/i,
+	);
+});
+
+await check("parsePressSummary reads the three sections of a press-summary block", async () => {
+	const answer = [
+		"Here you go:",
+		"<press-summary>",
+		"## Summary",
+		"Fixed the parser.",
+		"",
+		"## Files",
+		"- src/compact.ts (edited)",
+		"## Notes",
+		"The user wants the note preserved.",
+		"</press-summary>",
+	].join("\n");
+
+	assert.deepEqual(parsePressSummary(answer), {
+		summary: "Fixed the parser.",
+		files: "- src/compact.ts (edited)",
+		notes: "The user wants the note preserved.",
+	});
+
+	// Headings vary: numbered, case-different, without the hashes, with a colon.
+	assert.deepEqual(
+		parsePressSummary("<press-summary>\nSUMMARY:\na\nfiles\nb\n### Notes\nc\n</press-summary>"),
+		{ summary: "a", files: "b", notes: "c" },
+	);
+
+	// Prose without headings is still worth keeping, and empty sections are dropped.
+	assert.deepEqual(parsePressSummary("plain prose"), {
+		summary: "plain prose",
+		files: "",
+		notes: "",
+	});
+	assert.deepEqual(
+		parsePressSummary("<press-summary>\n## Summary\nonly this\n## Files\n\n</press-summary>"),
+		{ summary: "only this", files: "", notes: "" },
+	);
+
+	// Prose ahead of the first heading is the summary, not litter.
+	assert.deepEqual(
+		parsePressSummary("<press-summary>\nlead in\n## Files\na.ts\n</press-summary>"),
+		{ summary: "lead in", files: "a.ts", notes: "" },
+	);
+
+	// A truncated answer still has a usable body after the opening tag.
+	assert.deepEqual(parsePressSummary("<press-summary>\n## Summary\ncut off here"), {
+		summary: "cut off here",
+		files: "",
+		notes: "",
+	});
+
+	// Rendering is the shape the parse reads back.
+	const rendered = renderPressSummary({ summary: "s", files: "f", notes: "n" });
+	assert.deepEqual(parsePressSummary(rendered), { summary: "s", files: "f", notes: "n" });
+});
+
+await check("a summary split across text blocks is parsed as one answer", async () => {
+	// Providers return one text block per streamed segment; the sections straddle them.
+	const { ctx, calls } = fakeCtx({
+		respond: () => ({
+			stopReason: "stop",
+			usage: {},
+			content: [
+				{ type: "text", text: "<press-summary>\n## Summary\nhalf " },
+				{ type: "thinking", thinking: "ignore me" },
+				{ type: "text", text: "a summary\n## Notes\nthe note\n</press-summary>" },
+			],
+		}),
+	});
+
+	const result = await compactContext(ctx, [user("one"), assistant("two")], 1, "the note", SETTINGS);
+	assert.equal(result.kind, "compacted");
+	// Blocks are joined with a newline, the same separator pi's own summarizer uses, so
+	// separate blocks never glue two words together.
+	assert.equal(result.summary.summary, "half \na summary", "the adjacent blocks join");
+	assert.equal(result.summary.notes, "the note");
+	assert.equal(
+		result.message.content[0].text,
+		"<press-summary>\n## Summary\nhalf \na summary\n\n## Notes\nthe note\n</press-summary>",
+	);
+	assert.equal(calls.length, 1);
 });
 
 rmSync(isolatedAgentDir, { recursive: true, force: true });
