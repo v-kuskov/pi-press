@@ -4,12 +4,22 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { compactContext, DEFAULT_KEEP, PressError } from "./compact.ts";
 import type { ConversationMessage } from "./compact.ts";
 import { readPressSettings } from "./config.ts";
+import type { PressSettings } from "./config.ts";
 import { cacheMessages, takeStagedCompactedContext } from "./state.ts";
 
 /** One message of the conversation, as pi's `context` event carries it. */
 type AgentMessage = ContextEvent["messages"][number];
+
+/**
+ * The note a forced compaction carries into its prompt.
+ *
+ * The summary it produces is the only thing the following turns see, so the note is how the
+ * model is told why the conversation it remembers is suddenly short.
+ */
+const FORCE_NOTE = "Context was force-compacted due to token limit";
 
 /**
  * Warning text handed to the model when the context crosses the configured threshold.
@@ -67,12 +77,14 @@ export type ContextHookState = {
 /**
  * Register the `context` hook: the only place with a writable view of the conversation.
  *
- * It runs before every LLM call and does three things, in order:
+ * It runs before every LLM call and does four things, in order:
  *
  * 1. Caches `event.messages` for the `press` tool (see src/state.ts).
  * 2. Installs a compaction the tool staged. The tool cannot replace the conversation itself,
  *    so a manual `press` only takes effect here, on the next pass.
- * 3. Warns the model once when context usage crosses `press.warnTokens`.
+ * 3. Force-compacts silently when context usage crosses `press.forceTokens`, which is the
+ *    safety net for a model that never called `press` on its own.
+ * 4. Warns the model once when context usage crosses `press.warnTokens`.
  *
  * Settings are re-read on every pass rather than cached at load: a pass already costs a
  * provider round trip, the read is a local file, and this keeps an edited threshold live
@@ -90,11 +102,11 @@ export function registerContextHook(pi: ExtensionAPI): void {
  * `tokens` and `settings` and slots in above the warning, so a force pass replaces the
  * conversation and never also warns about it.
  */
-export function handleContext(
+export async function handleContext(
 	event: ContextEvent,
 	ctx: ExtensionContext,
 	state: ContextHookState,
-): ContextEventResult | undefined {
+): Promise<ContextEventResult | undefined> {
 	// Cache the conversation as pi handed it over: the warning appended below is ours, not
 	// part of the transcript, and must not end up in what `press` summarizes.
 	cacheMessages(event.messages);
@@ -114,10 +126,72 @@ export function handleContext(
 	if (tokens === undefined || tokens === null) return undefined;
 
 	const settings = readPressSettings(ctx.cwd);
+
+	// The hard limit first: at this pressure the conversation is compacted whether the model
+	// asked or not, and the pass ends here so the warning is never injected alongside it.
+	if (tokens >= settings.forceTokens) return forceCompact(event, ctx, state, settings);
+
 	if (tokens < settings.warnTokens || state.warned) return undefined;
 
 	state.warned = true;
 	return { messages: [...event.messages, warningMessage(tokens, settings.warnTokens)] };
+}
+
+/**
+ * Force-compact the conversation because context usage has reached the hard limit.
+ *
+ * The engine does the work: a forced compaction is a `press` with the default `keep`, so
+ * everything but the last message is summarized and the last message is preserved verbatim.
+ * The difference is who decides - here nobody does, which is why the pass returns the rebuilt
+ * array in place of the one pi handed over.
+ *
+ * A failure never retries inside the pass. A provider that is down would otherwise spin on
+ * every pass, so the conversation is handed back untouched with a note saying what happened,
+ * and the next turn decides what to do about it.
+ */
+async function forceCompact(
+	event: ContextEvent,
+	ctx: ExtensionContext,
+	state: ContextHookState,
+	settings: PressSettings,
+): Promise<ContextEventResult | undefined> {
+	try {
+		const result = await compactContext(ctx, event.messages, DEFAULT_KEEP, FORCE_NOTE, settings);
+
+		if (result.kind === "skipped") {
+			// Nothing was compacted, so this pass changed nothing - and the warning flag is left
+			// as it was. Clearing it here would re-arm a warning for pressure that never went away.
+			return undefined;
+		}
+
+		// Any compaction relieves the pressure the warning was about, so the next crossing gets
+		// its own warning (the same reset the staged-compaction branch performs above).
+		state.warned = false;
+		return { messages: asAgentMessages([result.message, ...result.kept]) };
+	} catch (error) {
+		return { messages: [...event.messages, forceFailureMessage(error)] };
+	}
+}
+
+/** The synthetic message that reports a failed forced compaction to the model. */
+function forceFailureMessage(error: unknown): AgentMessage {
+	const reason =
+		error instanceof PressError
+			? error.hint === undefined
+				? error.message
+				: `${error.message}\n\n${error.hint}`
+			: `Compaction failed: ${error instanceof Error ? error.message : String(error)}`;
+
+	return {
+		role: "system",
+		content: [
+			{
+				type: "text",
+				text: `The context is over the token limit but forced compaction did not happen, so the conversation is unchanged. ${reason}\n\nCall the press tool to compact the conversation yourself.`,
+			},
+		],
+		timestamp: Date.now(),
+	};
 }
 
 /**

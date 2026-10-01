@@ -71,6 +71,10 @@ function resetSettings() {
 
 const DEFAULTS = { warnTokens: DEFAULT_WARN_TOKENS, forceTokens: DEFAULT_FORCE_TOKENS };
 
+// Pressure over the warning threshold but under the hard limit. Warning cases run here,
+// because crossing forceTokens is the one thing that makes the warning not the response.
+const WARNING_PRESSURE = DEFAULT_WARN_TOKENS + 1000;
+
 // ------------------------------------------------------------------ factory
 
 await check("the factory registers the press tool and the context hook synchronously", async () => {
@@ -718,8 +722,8 @@ function hookCtx(tokens, cwd = tmpdir()) {
 }
 
 /** A pass over `messages`, as pi's runner would emit it. */
-function contextPass(handler, messages, tokens, cwd) {
-	return handler({ type: "context", messages }, hookCtx(tokens, cwd));
+function contextPass(handler, messages, tokens, cwd, extra) {
+	return handler({ type: "context", messages }, { ...hookCtx(tokens, cwd), ...extra });
 }
 
 /** An assistant turn that ends by requesting a tool: mid-turn, never a compaction point. */
@@ -828,7 +832,7 @@ await check("token pressure is only checked at an assistant text turn boundary",
 		// Same messages, same hook: at a real boundary the warning does fire, so the cases above
 		// prove the shape check and not a broken threshold.
 		const boundary = [user("one"), assistant("two")];
-		const warned = await contextPass(handler, boundary, DEFAULT_FORCE_TOKENS, root);
+		const warned = await contextPass(handler, boundary, WARNING_PRESSURE, root);
 		assert.equal(warned.messages.length, boundary.length + 1, "an assistant text turn does warn");
 	} finally {
 		cacheMessages([]);
@@ -846,10 +850,10 @@ await check("the warning is injected once while the flag is set", async () => {
 		const first = await contextPass(handler, messages, DEFAULT_WARN_TOKENS, root);
 		assert.equal(first.messages.length, messages.length + 1, "the first crossing warns");
 
-		const second = await contextPass(handler, messages, DEFAULT_WARN_TOKENS + 1000, root);
+		const second = await contextPass(handler, messages, WARNING_PRESSURE, root);
 		assert.equal(second, undefined, "further pressure while warned adds nothing");
 
-		const third = await contextPass(handler, messages, DEFAULT_FORCE_TOKENS, root);
+		const third = await contextPass(handler, messages, WARNING_PRESSURE + 1000, root);
 		assert.equal(third, undefined, "raising pressure does not re-inject the warning");
 	} finally {
 		cacheMessages([]);
@@ -916,6 +920,162 @@ await check("a compaction clears the warning flag", async () => {
 		assert.equal(second.messages.length, after.length + 1, "the next crossing warns again");
 	} finally {
 		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------- forced compaction
+
+await check("the hard limit force-compacts and keeps the last message verbatim", async () => {
+	resetSettings();
+	const root = tempProject();
+	const handler = contextHook();
+	const messages = [user("one"), assistant("two"), user("three"), assistant("four")];
+	try {
+		cacheMessages([]);
+		const { ctx, calls } = fakeCtx({ respond: () => OK });
+
+		const below = await contextPass(handler, messages, DEFAULT_FORCE_TOKENS - 1, root, ctx);
+		assert.equal(calls.length, 0, "under the limit nothing is compacted");
+		assert.equal(below.messages.length, messages.length + 1, "under the limit the warning still fires");
+
+		const forced = await contextPass(handler, messages, DEFAULT_FORCE_TOKENS, root, ctx);
+		assert.equal(calls.length, 1, "the limit spends one compaction call");
+		assert.equal(forced.messages.length, 2, "the conversation collapses to the summary and the tail");
+		assert.match(forced.messages[0].content[0].text, /^<press-summary>/, "the summary leads");
+		assert.deepEqual(forced.messages[1], messages.at(-1), "the last message survives verbatim");
+		assert.ok(
+			calls[0].context.messages[0].content[0].text.includes("Context was force-compacted due to token limit"),
+			"the prompt carries the forced-compaction note",
+		);
+	} finally {
+		cacheMessages([]);
+		resetSettings();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("the hard limit is only acted on at an assistant text turn boundary", async () => {
+	resetSettings();
+	const root = tempProject();
+	const handler = contextHook();
+	try {
+		cacheMessages([]);
+		const { ctx, calls } = fakeCtx({ respond: () => OK });
+
+		const midTurn = [user("one"), assistantToolCall(), toolResult("read", "contents")];
+		assert.equal(
+			await contextPass(handler, midTurn, DEFAULT_FORCE_TOKENS, root, ctx),
+			undefined,
+			"a trailing tool result is mid-turn and must not be compacted",
+		);
+		assert.equal(
+			await contextPass(handler, [user("one"), assistant("two"), assistantToolCall()], DEFAULT_FORCE_TOKENS, root, ctx),
+			undefined,
+			"an assistant turn that requests a tool must not be compacted",
+		);
+		assert.equal(calls.length, 0, "a mid-turn limit spends no compaction call");
+
+		const boundary = [user("one"), assistant("two")];
+		const forced = await contextPass(handler, boundary, DEFAULT_FORCE_TOKENS, root, ctx);
+		assert.equal(forced.messages.length, 2, "the same pressure at a boundary does compact");
+	} finally {
+		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a failed forced compaction returns the conversation plus one error note", async () => {
+	resetSettings();
+	const root = tempProject();
+	const handler = contextHook();
+	const messages = [user("one"), assistant("two")];
+	try {
+		cacheMessages([]);
+		const provider = fakeCtx({
+			respond: () => ({ stopReason: "error", errorMessage: "provider exploded", content: [] }),
+		});
+
+		const failed = await contextPass(handler, messages, DEFAULT_FORCE_TOKENS, root, provider.ctx);
+		assert.equal(failed.messages.length, messages.length + 1, "the conversation is handed back untouched");
+		assert.deepEqual(failed.messages.slice(0, messages.length), messages, "not one message is lost");
+		const note = failed.messages.at(-1);
+		assert.equal(note.role, "system", "the failure is reported as a system note");
+		assert.match(note.content[0].text, /provider exploded/, "it names the provider's reason");
+		assert.match(note.content[0].text, /did not happen/, "and says the compaction did not happen");
+		assert.equal(provider.calls.length, 1, "the failed call is not retried inside the pass");
+
+		// A caller that throws is reported the same way, and still no loop.
+		const throwing = fakeCtx({
+			respond: () => {
+				throw new Error("socket closed");
+			},
+		});
+		const thrown = await contextPass(handler, messages, DEFAULT_FORCE_TOKENS, root, throwing.ctx);
+		assert.equal(thrown.messages.length, messages.length + 1);
+		assert.match(thrown.messages.at(-1).content[0].text, /socket closed/);
+		assert.equal(throwing.calls.length, 1, "a throwing client is called once per pass, never in a loop");
+	} finally {
+		cacheMessages([]);
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a forced compaction clears the warning instead of warning about it", async () => {
+	resetSettings();
+	const root = tempProject();
+	const handler = contextHook();
+	const messages = [user("one"), assistant("two")];
+	try {
+		cacheMessages([]);
+		const { ctx } = fakeCtx({ respond: () => OK });
+
+		// Warn first, so the flag is set when the hard limit is reached.
+		const warned = await contextPass(handler, messages, DEFAULT_WARN_TOKENS, root, ctx);
+		assert.equal(warned.messages.length, messages.length + 1, "the crossing warns");
+
+		const forced = await contextPass(handler, messages, DEFAULT_FORCE_TOKENS, root, ctx);
+		assert.equal(forced.messages.length, 2, "the force pass replaces the conversation");
+		assert.ok(
+			!forced.messages.some((message) => message.role === "system"),
+			"no warning is injected alongside the compaction that relieved it",
+		);
+
+		// The flag cleared with the compaction, so pressure building again warns afresh.
+		const after = [forced.messages[0], user("four"), assistant("five")];
+		const second = await contextPass(handler, after, DEFAULT_WARN_TOKENS, root, ctx);
+		assert.equal(second.messages.length, after.length + 1, "the next crossing warns again");
+	} finally {
+		cacheMessages([]);
+		resetSettings();
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+await check("a skipped forced compaction resets nothing", async () => {
+	resetSettings();
+	const root = tempProject();
+	const handler = contextHook();
+	const messages = [user("one"), assistant("two")];
+	try {
+		cacheMessages([]);
+		const { ctx, calls } = fakeCtx({ respond: () => OK });
+		writeScope(root, "project", { [SETTINGS_KEY]: { warnTokens: 10, forceTokens: 20 } });
+
+		const warned = await contextPass(handler, messages, 15, root, ctx);
+		assert.equal(warned.messages.length, 3, "the crossing warns and sets the flag");
+
+		// One message with keep 1 leaves nothing to compact, so the engine reports skipped.
+		const skipped = await contextPass(handler, [user("three")], 25, root, ctx);
+		assert.equal(skipped, undefined, "a skipped compaction rewrites nothing");
+		assert.equal(calls.length, 0, "the engine returns before spending a call");
+
+		// The flag survived the skipped pass: pressure that was already warned about stays silent.
+		const again = await contextPass(handler, messages, 15, root, ctx);
+		assert.equal(again, undefined, "no warning is re-injected after a skipped force pass");
+	} finally {
+		cacheMessages([]);
+		resetSettings();
 		rmSync(root, { recursive: true, force: true });
 	}
 });
