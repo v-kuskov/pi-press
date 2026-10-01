@@ -286,13 +286,13 @@ function fakeCtx({ respond, model = { provider: "routerai", id: "session-model" 
 }
 
 /** The `<press-summary>` wrapper a well-behaved compaction model returns. */
-function summaryAnswer({ summary = "did the work", files = "src/a.ts", notes = "(none)" } = {}) {
-	return [
-		{
-			type: "text",
-			text: `<press-summary>\n## Summary\n${summary}\n## Files\n${files}\n## Notes\n${notes}\n</press-summary>`,
-		},
-	];
+function summaryAnswer({ task = "did the work", state = "", discoveries = "", next = "", context = "" } = {}) {
+	const sections = [`## Task Overview\n${task}`];
+	if (state) sections.push(`## Current State\n${state}`);
+	if (discoveries) sections.push(`## Important Discoveries\n${discoveries}`);
+	if (next) sections.push(`## Next Steps\n${next}`);
+	if (context) sections.push(`## Context to Preserve\n${context}`);
+	return [{ type: "text", text: `<press-summary>\n${sections.join("\n\n")}\n</press-summary>` }];
 }
 
 const OK = { stopReason: "stop", usage: {}, content: summaryAnswer() };
@@ -402,7 +402,7 @@ await check("compactContext compacts with the configured model and replaces the 
 await check("the caller's note is appended to the summary, not left to the model", async () => {
 	// The model answers without a Notes section at all, which is exactly the case the old
 	// prompt-dependent wording lost: the note must survive anyway, outside the model's control.
-	const { ctx } = fakeCtx({ respond: () => ({ stopReason: "stop", content: summaryAnswer({ notes: "" }) }) });
+	const { ctx } = fakeCtx({ respond: () => ({ stopReason: "stop", content: summaryAnswer() }) });
 
 	const result = await compactContext(
 		ctx,
@@ -419,9 +419,11 @@ await check("the caller's note is appended to the summary, not left to the model
 
 	// The block still parses back: the appended note is outside it, not a fourth section.
 	assert.deepEqual(parsePressSummary(text), {
-		summary: "did the work",
-		files: "src/a.ts",
-		notes: "",
+		taskOverview: "did the work",
+		currentState: "",
+		discoveries: "",
+		nextSteps: "",
+		context: "",
 	});
 
 	// A caller with nothing to say gets no trailing blank text.
@@ -526,59 +528,67 @@ await check("failureText words every failure the same way for both callers", asy
 	assert.equal(failureText("just a string"), "Compaction failed: just a string");
 });
 
-await check("parsePressSummary reads the three sections of a press-summary block", async () => {
+await check("parsePressSummary reads the five sections of a press-summary block", async () => {
 	const answer = [
 		"Here you go:",
 		"<press-summary>",
-		"## Summary",
+		"## Task Overview",
 		"Fixed the parser.",
 		"",
-		"## Files",
+		"## Current State",
+		"Working.",
+		"## Important Discoveries",
 		"- src/compact.ts (edited)",
-		"## Notes",
+		"## Context to Preserve",
 		"The user wants the note preserved.",
 		"</press-summary>",
 	].join("\n");
 
 	assert.deepEqual(parsePressSummary(answer), {
-		summary: "Fixed the parser.",
-		files: "- src/compact.ts (edited)",
-		notes: "The user wants the note preserved.",
+		taskOverview: "Fixed the parser.",
+		currentState: "Working.",
+		discoveries: "- src/compact.ts (edited)",
+		nextSteps: "",
+		context: "The user wants the note preserved.",
 	});
 
 	// Headings vary: numbered, case-different, without the hashes, with a colon.
 	assert.deepEqual(
-		parsePressSummary("<press-summary>\nSUMMARY:\na\nfiles\nb\n### Notes\nc\n</press-summary>"),
-		{ summary: "a", files: "b", notes: "c" },
+		parsePressSummary("<press-summary>\nTask Overview:\na\ncurrent state\nb\n### Important Discoveries\nc\n</press-summary>"),
+		{ taskOverview: "a", currentState: "b", discoveries: "c", nextSteps: "", context: "" },
 	);
 
 	// Prose without headings is still worth keeping, and empty sections are dropped.
 	assert.deepEqual(parsePressSummary("plain prose"), {
-		summary: "plain prose",
-		files: "",
-		notes: "",
+		taskOverview: "plain prose",
+		currentState: "",
+		discoveries: "",
+		nextSteps: "",
+		context: "",
 	});
 	assert.deepEqual(
-		parsePressSummary("<press-summary>\n## Summary\nonly this\n## Files\n\n</press-summary>"),
-		{ summary: "only this", files: "", notes: "" },
+		parsePressSummary("<press-summary>\n## Task Overview\nonly this\n## Current State\n\n</press-summary>"),
+		{ taskOverview: "only this", currentState: "", discoveries: "", nextSteps: "", context: "" },
 	);
 
-	// Prose ahead of the first heading is the summary, not litter.
+	// Prose ahead of the first heading is the task overview, not litter.
 	assert.deepEqual(
-		parsePressSummary("<press-summary>\nlead in\n## Files\na.ts\n</press-summary>"),
-		{ summary: "lead in", files: "a.ts", notes: "" },
+		parsePressSummary("<press-summary>\nlead in\n## Context to Preserve\na.ts\n</press-summary>"),
+		{ taskOverview: "lead in", currentState: "", discoveries: "", nextSteps: "", context: "a.ts" },
 	);
 
 	// A truncated answer still has a usable body after the opening tag.
-	assert.deepEqual(parsePressSummary("<press-summary>\n## Summary\ncut off here"), {
-		summary: "cut off here",
-		files: "",
-		notes: "",
+	assert.deepEqual(parsePressSummary("<press-summary>\n## Task Overview\ncut off here"), {
+		taskOverview: "cut off here",
+		currentState: "",
+		discoveries: "",
+		nextSteps: "",
+		context: "",
 	});
 
 	// Rendering is the shape the parse reads back.
-	const rendered = renderPressSummary({ summary: "s", files: "f", notes: "n" });
-	assert.deepEqual(parsePressSummary(rendered), { summary: "s", files: "f", notes: "n" });
+	const rendered = renderPressSummary({ taskOverview: "s", currentState: "c", discoveries: "d", nextSteps: "n", context: "x" });
+	assert.deepEqual(parsePressSummary(rendered), { taskOverview: "s", currentState: "c", discoveries: "d", nextSteps: "n", context: "x" });
 });
 
 await check("a summary split across text blocks is parsed as one answer", async () => {
@@ -588,9 +598,9 @@ await check("a summary split across text blocks is parsed as one answer", async 
 			stopReason: "stop",
 			usage: {},
 			content: [
-				{ type: "text", text: "<press-summary>\n## Summary\nhalf " },
+				{ type: "text", text: "<press-summary>\n## Task Overview\nhalf " },
 				{ type: "thinking", thinking: "ignore me" },
-				{ type: "text", text: "a summary\n## Notes\nthe note\n</press-summary>" },
+				{ type: "text", text: "a summary\n## Context to Preserve\nthe note\n</press-summary>" },
 			],
 		}),
 	});
@@ -600,13 +610,15 @@ await check("a summary split across text blocks is parsed as one answer", async 
 	// Blocks are joined with a newline, the same separator pi's own summarizer uses, so
 	// separate blocks never glue two words together. The caller's note then follows the block.
 	assert.deepEqual(parsePressSummary(result.message.content[0].text), {
-		summary: "half \na summary",
-		files: "",
-		notes: "the note",
+		taskOverview: "half \na summary",
+		currentState: "",
+		discoveries: "",
+		nextSteps: "",
+		context: "the note",
 	});
 	assert.equal(
 		result.message.content[0].text,
-		"<press-summary>\n## Summary\nhalf \na summary\n\n## Notes\nthe note\n</press-summary>\n\nthe note",
+		"<press-summary>\n## Task Overview\nhalf \na summary\n\n## Context to Preserve\nthe note\n</press-summary>\n\nthe note",
 	);
 	assert.equal(calls.length, 1);
 });
@@ -1134,7 +1146,7 @@ await check("the hard limit force-compacts and keeps the last message verbatim",
 			text.endsWith("Context was force-compacted due to token limit"),
 			`the note is guaranteed to reach the model, got: ${text}`,
 		);
-		assert.equal(parsePressSummary(text).notes, "(none)", "the block is unchanged by the appended note");
+		assert.equal(parsePressSummary(text).context, "", "the block is unchanged by the appended note");
 
 		assert.ok(
 			calls[0].context.messages[0].content[0].text.includes("Context was force-compacted due to token limit"),

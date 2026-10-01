@@ -43,11 +43,13 @@ export type Snapshot =
 	  }
 	| { kind: "nothing"; note: string };
 
-/** The three sections of a `<press-summary>` block. */
+/** The five sections of a `<press-summary>` block. */
 export type PressSummary = {
-	summary: string;
-	files: string;
-	notes: string;
+	taskOverview: string;
+	currentState: string;
+	discoveries: string;
+	nextSteps: string;
+	context: string;
 };
 
 /** A finished compaction. */
@@ -283,7 +285,7 @@ function describeModel(model: unknown): string {
 	return "the session model";
 }
 
-/** The prompt: what to preserve, the shape to answer in, and the conversation itself. */
+/** The prompt: continuation framing, structured sections, and the conversation itself. */
 function buildPrompt(
 	snapshot: string,
 	compacted: number,
@@ -294,19 +296,25 @@ function buildPrompt(
 		? `\nThe caller asked you to preserve this in particular:\n${note}\n`
 		: "";
 
-	return `You compact a coding-agent conversation so the agent can keep working from a smaller context.
+	return `Write a continuation summary that will allow you (or another instance of yourself) to resume work efficiently.
 
-The ${compacted} messages below are replaced by your answer; the last ${kept} messages are preserved verbatim after it. Record what the next turn needs: what was asked, the decisions taken, the state of the work, the files touched, and what comes next.
+The ${compacted} messages below are replaced by your answer; the last ${kept} messages are preserved verbatim after it.
 ${noteBlock}
-Answer with exactly one <press-summary> block and nothing else, in this shape:
+Err on the side of including information that would prevent duplicate work or repeated mistakes.
+
+Answer with exactly one <press-summary> block and nothing else:
 
 <press-summary>
-## Summary
-<what happened, the decisions, the current state, the next steps>
-## Files
-<files read or changed, one per line, and why>
-## Notes
-<anything from the caller's request that must survive; (none) when there was none>
+## Task Overview
+<what the user asked for and the overall goal>
+## Current State
+<where the work stands — progress made, what's working, what's broken>
+## Important Discoveries
+<decisions and their rationale, errors and their resolution, approaches tried and abandoned>
+## Next Steps
+<what to do next, open questions, blockers>
+## Context to Preserve
+<file paths, user constraints, conventions, anything else the next turn needs>
 </press-summary>
 
 Conversation to compact (${compacted} messages):
@@ -315,37 +323,67 @@ ${snapshot}`;
 }
 
 /**
- * The three sections the prompt asks for, in the order they are rendered.
+/**
+ * The five sections the prompt asks for, in the order they are rendered.
  *
  * The prompt's expected shape and the parser's expectations are kept in one place so the
  * two cannot drift apart.
  */
-const SUMMARY_SECTIONS = ["summary", "files", "notes"] as const;
+const SUMMARY_SECTIONS: (keyof PressSummary)[] = [
+	"taskOverview",
+	"currentState",
+	"discoveries",
+	"nextSteps",
+	"context",
+];
 
 /**
- * A line that is one of the three section headings, and nothing else.
+ * Maps the lowercased heading text the model might produce to the canonical section key.
  *
- * Markdown depth varies, the trailing colon varies, and some models drop the hashes
- * entirely, so all three are accepted. The whole line must be the heading, which is what
- * keeps a prose line that merely mentions "files" from splitting a section.
+ * Accepts short forms (task, state, next, context) and full forms (task overview,
+ * current state, next steps, context to preserve).  Old three-section headings
+ * (summary, files, notes) are intentionally absent so pre-update summaries degrade
+ * into the preamble fallback rather than filling the wrong field.
  */
-const SECTION_HEADING = /^#{0,4}\s*(summary|files|notes)\s*:?\s*$/i;
+const SECTION_KEY: Record<string, keyof PressSummary> = {
+	"task overview": "taskOverview",
+	task: "taskOverview",
+	"current state": "currentState",
+	state: "currentState",
+	"important discoveries": "discoveries",
+	discoveries: "discoveries",
+	"next steps": "nextSteps",
+	"next step": "nextSteps",
+	next: "nextSteps",
+	"context to preserve": "context",
+	context: "context",
+};
+
+/** If line is a recognized section heading, return its canonical key. */
+function headingKey(line: string): keyof PressSummary | undefined {
+	const m = /^#{0,4}\s*(.+?)\s*:?\s*$/i.exec(line);
+	if (!m || m[1] === undefined) return undefined;
+	return SECTION_KEY[m[1].toLowerCase().replace(/\s+/g, " ")];
+}
+
 
 /**
- * Read the three sections out of the model's answer.
+ * Read the five sections out of the model's answer.
  *
  * A model that answered in prose without headings is still worth keeping: the whole answer
- * becomes the summary, since a usable summary beats a failed call. Headings are matched
+ * becomes the task overview, since a usable summary beats a failed call.  Headings are matched
  * case-insensitively and at any depth, because models vary in how they punctuate them.
  */
 export function parsePressSummary(raw: string): PressSummary {
 	const block = pressSummaryBody(raw);
 	const { preamble, sections } = splitSections(block);
 	return {
-		// A model that opened with prose before its first heading put the summary there.
-		summary: sections.summary ?? preamble ?? block,
-		files: sections.files ?? "",
-		notes: sections.notes ?? "",
+		// A model that opened with prose before its first heading put the task overview there.
+		taskOverview: sections.taskOverview ?? preamble ?? block,
+		currentState: sections.currentState ?? "",
+		discoveries: sections.discoveries ?? "",
+		nextSteps: sections.nextSteps ?? "",
+		context: sections.context ?? "",
 	};
 }
 
@@ -362,31 +400,34 @@ function pressSummaryBody(raw: string): string {
 /**
  * Split a block body on its section headings.
  *
- * `preamble` is the text before the first heading, and sections that came back empty are
- * dropped rather than stored as empty strings - a heading with nothing under it carries no
- * information to preserve.
+ * preamble is the text before the first recognized heading, and sections that came back
+ * empty are dropped rather than stored as empty strings - a heading with nothing under it
+ * carries no information to preserve.
  */
 function splitSections(block: string): {
 	preamble: string | undefined;
-	sections: Partial<Record<(typeof SUMMARY_SECTIONS)[number], string>>;
+	sections: Partial<Record<keyof PressSummary, string>>;
 } {
-	const bodies = new Map<string, string[]>();
+	const bodies = new Map<keyof PressSummary, string[]>();
 	const leading: string[] = [];
-	let current: string | undefined;
+	let current: keyof PressSummary | undefined;
 
 	for (const line of block.split("\n")) {
-		const heading = SECTION_HEADING.exec(line);
-		if (heading?.[1] !== undefined) current = heading[1].toLowerCase();
+		const key = headingKey(line);
+		if (key !== undefined) current = key;
 		if (current === undefined) {
 			leading.push(line);
 			continue;
 		}
-		const body = bodies.get(current) ?? [];
-		if (heading === null) body.push(line);
-		bodies.set(current, body);
+		if (key === undefined) {
+			// Content line under a recognized section.
+			const body = bodies.get(current) ?? [];
+			body.push(line);
+			bodies.set(current, body);
+		}
 	}
 
-	const sections: Partial<Record<(typeof SUMMARY_SECTIONS)[number], string>> = {};
+	const sections: Partial<Record<keyof PressSummary, string>> = {};
 	for (const section of SUMMARY_SECTIONS) {
 		const body = bodies.get(section)?.join("\n").trim();
 		if (body) sections[section] = body;
@@ -395,23 +436,27 @@ function splitSections(block: string): {
 	return { preamble: leading.join("\n").trim() || undefined, sections };
 }
 
+
 /**
  * The canonical form of a summary, as it lands in the context.
  *
  * Sections that came back empty are dropped rather than filled with a placeholder: the
- * model that follows will not read "(none)" as information.
+ * model that follows will not read "(none)" as information.  Task Overview is always
+ * rendered because it is the primary section.
  */
-export function renderPressSummary({ summary, files, notes }: PressSummary): string {
-	const parts = [`## Summary\n${summary}`];
-	if (files) parts.push(`## Files\n${files}`);
-	if (notes) parts.push(`## Notes\n${notes}`);
+export function renderPressSummary(ps: PressSummary): string {
+	const parts = [`## Task Overview\n${ps.taskOverview}`];
+	if (ps.currentState) parts.push(`## Current State\n${ps.currentState}`);
+	if (ps.discoveries) parts.push(`## Important Discoveries\n${ps.discoveries}`);
+	if (ps.nextSteps) parts.push(`## Next Steps\n${ps.nextSteps}`);
+	if (ps.context) parts.push(`## Context to Preserve\n${ps.context}`);
 	return `<press-summary>\n${parts.join("\n\n")}\n</press-summary>`;
 }
 
 /**
  * The summary block with the caller's note appended after it.
  *
- * The note is appended here, not left for the compaction model to echo into its Notes section.
+ * The note is appended here, not left for the compaction model to paraphrase into its output.
  * The one line explaining why the conversation is suddenly short is exactly the line a summary
  * must not lose, and a model that paraphrases or drops it would lose it silently - so the note
  * is added to the message outside the model's control, and `renderPressSummary` stays the pure
