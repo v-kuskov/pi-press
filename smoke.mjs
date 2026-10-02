@@ -25,6 +25,7 @@ import {
 	SETTINGS_KEY,
 } from "./src/config.ts";
 import { handleContext, registerContextHook } from "./src/context-hook.ts";
+import { compactionMessages, unwrapPressSummary } from "./src/compact-command.ts";
 import { registerPressTool } from "./src/press-tool.ts";
 import { registerTrimTool } from "./src/trim-tool.ts";
 import { createPressState } from "./src/state.ts";
@@ -79,7 +80,7 @@ const WARNING_PRESSURE = DEFAULT_WARN_TOKENS + 1000;
 
 // ------------------------------------------------------------------ factory
 
-await check("the factory registers the press tool and the context hook synchronously", async () => {
+await check("the factory registers the tools, the context hook, and the compact command", async () => {
 	const tools = [];
 	const handlers = [];
 	const factory = extensionFactory;
@@ -92,7 +93,11 @@ await check("the factory registers the press tool and the context hook synchrono
 	});
 
 	assert.equal(result, undefined, "the factory is synchronous");
-	assert.deepEqual(handlers, ["context"], "the context hook is the only hook registered");
+	assert.deepEqual(
+		handlers,
+		["context", "session_before_compact"],
+		"the context hook and the compact command are the only hooks registered",
+	);
 	assert.deepEqual(
 		tools.map((tool) => tool.name),
 		["press", "trim"],
@@ -709,33 +714,147 @@ await check("findAnchor rejects tag mentions that are not compactions", async ()
 	assert.equal(anchor.text, "## Task Overview\nreal\n\n## Context to Preserve\nsrc/compact.ts");
 });
 
-await check("findAnchor recognizes a trim note, closed or truncated", async () => {
-	const messages = [user("one"), trimAnchor(), assistant("after the trim")];
-	const anchor = findAnchor(messages);
-	assert.equal(anchor.kind, "trim");
-	assert.equal(anchor.afterIndex, 1);
-	assert.equal(anchor.text, "12 tool results replaced with [trimmed].");
-
-	const truncated = findAnchor([assistant("<press-trim>\n20 tool results replaced with [trimmed].")]);
-	assert.equal(truncated.kind, "trim", "an unclosed tail is still a trim anchor");
-	assert.equal(truncated.text, "20 tool results replaced with [trimmed].");
-
-	// The tag alone is not the signal: prose mentioning the format lacks the count line.
+await check("findAnchor ignores trim notes and still requires a real summary", async () => {
+	// A trim note records one trim, not a compaction. What a later compaction needs is only
+	// that the results it replaced are placeholders - which it can read off the placeholders -
+	// so a note is not a competing merge source and cannot shadow a summary.
+	assert.equal(
+		findAnchor([user("one"), trimAnchor(), assistant("after the trim")]),
+		undefined,
+		"a trim note is not an anchor",
+	);
+	assert.equal(
+		findAnchor([assistant("<press-trim>\n20 tool results replaced with [trimmed].")]),
+		undefined,
+		"a truncated trim note is not an anchor either",
+	);
 	assert.equal(
 		findAnchor([assistant("keep <press-trim> in mind")]),
 		undefined,
-		"assistant prose mentioning the tag is not a trim anchor",
+		"assistant prose mentioning the tag is not a summary",
 	);
 
-	// A trim and a summary in the same run: the later one is the anchor.
-	const both = [trimAnchor(), user("work"), summaryAnchor("after")];
-	assert.equal(findAnchor(both).kind, "summary");
-	assert.equal(findAnchor(both.slice(0, 2)).kind, "trim");
+	// The note no longer hides the summary it was staged ahead of: the summary is still found
+	// wherever it sits, even after the note.
+	const noteThenSummary = [trimAnchor(), summaryAnchor("after"), user("work")];
+	assert.equal(findAnchor(noteThenSummary).kind, "summary", "the summary is found past the note");
+	assert.equal(findAnchor(noteThenSummary).afterIndex, 1, "at its own index, not the note's");
+
+	// A summary still wins over an older summary, and a note between them changes nothing.
+	const two = [summaryAnchor("first"), trimAnchor(), summaryAnchor("second")];
+	assert.equal(findAnchor(two).afterIndex, 2, "the latest summary wins");
+});
+
+await check("findAnchor reads a pi-persisted compactionSummary as a summary", async () => {
+	// `/compact` persists a compactionSummary message rather than an assistant block. A later
+	// press has to see it, or it re-summarizes a conversation that was just compacted.
+	const piSummary = {
+		role: "compactionSummary",
+		summary: "## Goal\nport the parser\n\n## Progress\n- [x] started",
+		tokensBefore: 1234,
+		timestamp: 1,
+	};
+
+	const anchor = findAnchor([user("one"), piSummary, assistant("more work")]);
+	assert.equal(anchor.kind, "summary", "a pi compaction is an anchor");
+	assert.equal(anchor.afterIndex, 1, "at its own index");
+	assert.equal(
+		anchor.text,
+		"## Goal\nport the parser\n\n## Progress\n- [x] started",
+		"its own sections are kept as written, since our parser does not know pi's headings",
+	);
+	assert.deepEqual(
+		findAnchor([user("one"), piSummary]),
+		{ kind: "summary", text: "## Goal\nport the parser\n\n## Progress\n- [x] started", afterIndex: 1 },
+		"scanning finds it without an assistant turn after it",
+	);
+
+	// Our own block nested inside one is unwrapped, so the anchor text stays the sections.
+	assert.equal(
+		findAnchor([{ role: "compactionSummary", summary: "<press-summary>\n## Task Overview\nnested\n</press-summary>", timestamp: 2 }]).text,
+		"## Task Overview\nnested",
+		"a press summary persisted by pi is unwrapped to its body",
+	);
+
+	// An empty or malformed one is not an anchor: there is nothing to merge into.
+	assert.equal(findAnchor([{ role: "compactionSummary", summary: "   ", timestamp: 3 }]), undefined);
+	assert.equal(findAnchor([{ role: "compactionSummary", timestamp: 4 }]), undefined);
+
+	// The latest summary wins across both shapes.
+	const both = [summaryAnchor("ours"), user("work"), { role: "compactionSummary", summary: "## Goal\ntheirs", timestamp: 5 }];
+	assert.equal(findAnchor(both).text, "## Goal\ntheirs", "the later pi compaction beats the earlier press");
+});
+
+await check("compactionMessages gathers everything a manual compact will discard", async () => {
+	const history = [user("one"), assistant("two")];
+
+	// Nothing extra: the messages pi means to summarize are the messages to summarize.
+	assert.deepEqual(
+		compactionMessages({ messagesToSummarize: history, turnPrefixMessages: [], isSplitTurn: false }),
+		history,
+		"a whole-turn cut needs only the history",
+	);
+
+	// A split turn discards its prefix too, and dropping it would lose a turn in progress.
+	const prefix = [user("mid-turn"), assistant("half an answer")];
+	assert.deepEqual(
+		compactionMessages({ messagesToSummarize: history, turnPrefixMessages: prefix, isSplitTurn: true }),
+		[...history, ...prefix],
+		"the split turn's prefix is appended after the history",
+	);
+	assert.deepEqual(
+		compactionMessages({ messagesToSummarize: history, turnPrefixMessages: prefix, isSplitTurn: false }),
+		history,
+		"without a split the prefix is ignored, so nothing is summarized twice",
+	);
+
+	// An earlier summary leads, so findAnchor merges the new messages into it rather than
+	// starting over - the same shape pi replays on the way back in.
+	const merged = compactionMessages({
+		messagesToSummarize: history,
+		turnPrefixMessages: [],
+		isSplitTurn: false,
+		previousSummary: "## Goal\nearlier work",
+	});
+	assert.equal(merged.length, 3, "the previous summary is prepended");
+	assert.equal(merged[0].role, "compactionSummary");
+	assert.equal(findAnchor(merged).text, "## Goal\nearlier work", "and is found as the anchor");
+	assert.deepEqual(merged.slice(1), history, "with the fresh messages after it");
+
+	// A blank or absent summary adds nothing: there is no earlier work to merge into.
+	for (const previousSummary of [undefined, "", "   "]) {
+		assert.deepEqual(
+			compactionMessages({ messagesToSummarize: history, turnPrefixMessages: [], isSplitTurn: false, previousSummary }),
+			history,
+			`no summary is prepended for ${JSON.stringify(previousSummary)}`,
+		);
+	}
+});
+
+await check("unwrapPressSummary stores bare sections and keeps the caller's note", async () => {
+	// What the engine renders, with the note appended after the closing tag by appendNote.
+	const rendered = "<press-summary>\n## Task Overview\nthe plan\n</press-summary>\n\nkeep the schema stable";
+	const stored = unwrapPressSummary(rendered).trim();
+
+	assert.ok(
+		!stored.includes("press-summary"),
+		"the block's tags are gone, so pi's own <summary> is the only wrapper",
+	);
+	assert.ok(stored.startsWith("## Task Overview"), "the sections are what is stored");
+	assert.ok(
+		stored.endsWith("keep the schema stable"),
+		"and the caller's note survives, which extracting the block body alone would drop",
+	);
+
+	// An answer truncated by a token limit has no closing tag; it still unwraps.
+	assert.equal(
+		unwrapPressSummary("<press-summary>\n## Task Overview\ncut off").trim(),
+		"## Task Overview\ncut off",
+	);
 });
 
 await check("trimMessages replaces tool results without dropping the messages", async () => {
-	const call = assistantToolCall("read");
-	const first = { ...toolResult("read", "the whole file"), toolCallId: "call-1" };
+	const call = assistantToolCall("read");	const first = { ...toolResult("read", "the whole file"), toolCallId: "call-1" };
 	const second = { ...toolResult("bash", "a pile of output"), toolCallId: "call-2" };
 	const messages = [call, first, second, assistant("done reading"), user("tail")];
 
@@ -771,28 +890,30 @@ await check("trimMessages replaces tool results without dropping the messages", 
 	assert.equal(trimMessages(messages, 0).trimmed, 2);
 });
 
-await check("trimMessages skips what is already processed or has nothing to trim", async () => {
+await check("trimMessages leaves spent results alone and has nothing to trim when all are spent", async () => {
 	const old = { ...toolResult("read", "old output"), toolCallId: "call-old" };
 	const fresh = { ...toolResult("read", "new output"), toolCallId: "call-new" };
 
-	// The anchor region is already processed: only what follows it is a candidate.
+	// A trim is region-blind: it reclaims every result still holding its output, wherever it
+	// sits, and says nothing about notes, which are the model's own record and stay put.
 	const messages = [old, summaryAnchor(), fresh, assistant("end"), user("tail")];
 	const result = trimMessages(messages, 1);
 	assert.equal(result.kind, "trimmed");
-	assert.equal(result.trimmed, 1, "only the result after the anchor is trimmed");
-	assert.deepEqual(
-		result.messages[0].content,
-		[{ type: "text", text: "old output" }],
-		"before the anchor is left alone",
-	);
+	assert.equal(result.trimmed, 2, "both results still holding output are reclaimed");
+	assert.deepEqual(result.messages[0].content, [{ type: "text", text: "[trimmed]" }]);
 	assert.deepEqual(result.messages[2].content, [{ type: "text", text: "[trimmed]" }]);
 
-	// A trim is never applied twice to what a previous trim already replaced.
-	const afterTrim = trimMessages([trimAnchor(), fresh, user("tail")], 1);
-	assert.equal(afterTrim.trimmed, 1, "the fresh result after a trim note is trimmed");
-	const nothingNew = trimMessages([trimAnchor(), assistant("no tools here")], 1);
-	assert.equal(nothingNew.kind, "nothing");
+	// A result a previous trim already replaced has nothing left to reclaim. Counting it again
+	// would report work that did not happen and stage a note about it, growing the context.
+	const already = { ...toolResult("read", "[trimmed]"), toolCallId: "call-done" };
+	const nothingNew = trimMessages([trimAnchor(), already, assistant("end"), user("tail")], 1);
+	assert.equal(nothingNew.kind, "nothing", "a spent result is not trimmed a second time");
 	assert.match(nothingNew.note, /No tool results to trim/);
+
+	// Mixed: the spent one is skipped, the live one is reclaimed, and only the live one counts.
+	const mixed = trimMessages([already, fresh, assistant("end"), user("tail")], 1);
+	assert.equal(mixed.kind, "trimmed");
+	assert.equal(mixed.trimmed, 1, "only the result still holding output is counted");
 
 	// The same nothing-cases as buildSnapshot, so the tool can word them the same way.
 	const noTools = trimMessages([user("one"), assistant("two")], 1);
@@ -864,29 +985,34 @@ await check("compactContext merges new messages into the existing summary", asyn
 	assert.deepEqual(result.kept, [messages[3]], "and the kept tail is unchanged");
 });
 
-await check("compactContext frames a trim anchor as fresh work, and skips an empty tail", async () => {
+await check("compactContext ignores a trim note and summarizes what is around it", async () => {
 	const trimmed = trimAnchor("40 tool results replaced with [trimmed].");
 	const { ctx, calls } = fakeCtx({ respond: () => OK });
 
+	// A trim note is not an anchor, so nothing is skipped on its account: every message that is
+	// not the kept tail is summarized, and the note never reaches the prompt as a merge source.
 	const messages = [trimmed, user("new question"), assistant("new answer"), user("tail")];
 	const result = await compactContext(ctx, messages, 1, undefined, SETTINGS);
 	assert.equal(result.kind, "compacted");
 	const prompt = calls[0].context.messages[0].content[0].text;
-	assert.ok(prompt.includes("previously trimmed"), "the prompt explains the trimmed history");
-	assert.ok(prompt.includes("Summarize only the new messages"));
-	assert.ok(prompt.includes("40 tool results replaced"), "the trim note travels into the prompt");
-	assert.ok(prompt.includes("new question"));
+	assert.ok(!prompt.includes("previously trimmed"), "no trim framing is added to the prompt");
+	assert.ok(!prompt.includes("Trim note:"), "and no trim note is handed over as an anchor");
+	assert.ok(prompt.includes("new question"), "the new work is summarized");
+	assert.equal(result.compacted, 3, "the whole compacted run is covered");
 
-	// The anchor is the last message of the compacted run: there is nothing left to summarize.
-	const nothing = await compactContext(ctx, [trimmed, user("tail")], 1, undefined, SETTINGS);
-	assert.equal(nothing.kind, "skipped");
-	assert.match(nothing.note, /nothing new to summarize/i);
-	assert.equal(calls.length, 1, "a skipped continuation spends no model call");
+	// The note stays an ordinary assistant message: compaction gives it no special treatment,
+	// so its text is summarized along with the rest rather than becoming a cut point.
+	assert.ok(prompt.includes("new answer"), "the run before the kept tail is all summarized");
 
-	// A note is still appended, never prompted, on the anchored path too.
-	const noted = await compactContext(ctx, messages, 1, "a fresh note", SETTINGS);
-	assert.ok(noted.message.content[0].text.endsWith("a fresh note"));
-	assert.ok(!calls[1].context.messages[0].content[0].text.includes("a fresh note"));
+	// A trail of trim notes changes nothing about how the run is summarized.
+	const noted = await compactContext(ctx, [trimmed, trimmed, user("tail")], 1, undefined, SETTINGS);
+	assert.equal(noted.kind, "compacted", "notes are not cut points");
+	assert.ok(!calls[1].context.messages[0].content[0].text.includes("Trim note:"));
+
+	// A note is still appended, never prompted.
+	const appended = await compactContext(ctx, messages, 1, "a fresh note", SETTINGS);
+	assert.ok(appended.message.content[0].text.endsWith("a fresh note"));
+	assert.ok(!calls[2].context.messages[0].content[0].text.includes("a fresh note"));
 });
 
 await check("renderPressSummary appends the referenced files inside Context to Preserve", async () => {
@@ -1247,7 +1373,7 @@ await check("trim replaces old tool results and stages an anchor plus the trimme
 	);
 });
 
-await check("the trim note travels inside the anchor block", async () => {
+await check("the trim note travels inside the note block", async () => {
 	resetSettings();
 	const state = createPressState();
 	state.cacheMessages(trimmableConversation());
@@ -1269,9 +1395,9 @@ await check("the trim note travels inside the anchor block", async () => {
 		"the tool result stays factual: the model reads its note back from the anchor",
 	);
 	assert.equal(
-		findAnchor(state.staged().messages).text.split("\n").at(-1),
+		state.staged().messages[0].content[0].text.split("\n").at(-2),
 		"Note: decided to keep the schema stable",
-		"a later findAnchor surfaces the note to the next compaction",
+		"the note is recorded in the trim's own note, which is the model's record of the trim",
 	);
 
 	// A whitespace-only note leaves no line behind at all.
@@ -1318,7 +1444,7 @@ await check("trim reports a context with nothing to trim without staging", async
 	assert.equal(state.staged(), undefined);
 });
 
-await check("a trim a context pass later installs leaves the anchor in the conversation", async () => {
+await check("a trim a context pass later installs leaves the note in the conversation", async () => {
 	resetSettings();
 	const root = tempProject();
 	try {
@@ -1330,9 +1456,18 @@ await check("a trim a context pass later installs leaves the anchor in the conve
 		await trimmer.execute("call-1", { keep: 1, note: "the plan holds" }, undefined, undefined, undefined);
 
 		const installed = await contextPass(registration, messages, DEFAULT_WARN_TOKENS - 1, root);
-		assert.equal(installed.messages.length, messages.length + 1, "the anchor is added, nothing dropped");
-		assert.match(installed.messages[0].content[0].text, /^<press-trim>/, "the anchor leads");
-		assert.equal(findAnchor(installed.messages).kind, "trim", "and the next compaction sees it");
+		assert.equal(installed.messages.length, messages.length + 1, "the note is added, nothing dropped");
+		assert.match(installed.messages[0].content[0].text, /^<press-trim>/, "the note leads");
+		assert.equal(
+			installed.messages.filter((m) => m.content?.[0]?.text === "[trimmed]").length,
+			2,
+			"the reclaimed results are placeholders in the installed context",
+		);
+		assert.equal(
+			findAnchor(installed.messages),
+			undefined,
+			"the note is the model's record, not an anchor the next compaction merges into",
+		);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

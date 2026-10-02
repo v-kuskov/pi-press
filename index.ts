@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerCompactCommand } from "./src/compact-command.ts";
 import { registerContextHook } from "./src/context-hook.ts";
 import { registerPressTool } from "./src/press-tool.ts";
 import { registerTrimTool } from "./src/trim-tool.ts";
@@ -14,6 +15,10 @@ import { createPressState } from "./src/state.ts";
  * The two tools split the work: `trim` reclaims the tokens sitting in old tool results for
  * nothing, `press` spends a model call to turn the conversation into a summary.
  *
+ * `registerCompactCommand` makes the same engine what a manual `/compact` runs, so the command
+ * persists a real compaction entry instead of the per-request projection the context hook
+ * installs. It shares no state with the tools: it is driven entirely by the event pi emits.
+ *
  * The three share one state instance created here, so a process hosting more than one session
  * gives each its own conversation and its own pending compaction.
  *
@@ -26,4 +31,5 @@ export default function piPress(pi: ExtensionAPI): void {
 	registerPressTool(pi, state);
 	registerTrimTool(pi, state);
 	registerContextHook(pi, state);
+	registerCompactCommand(pi);
 }

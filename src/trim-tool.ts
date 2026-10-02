@@ -40,10 +40,11 @@ export type TrimDetails = {
  * reaches for `trim` when it needs tokens now, and for `press` when the conversation itself
  * needs to become a summary.
  *
- * The pass leaves a `<press-trim>` anchor message in the conversation - counts, the files the
- * trimmed run named, and the caller's note - so a later `findAnchor` sees what was trimmed and
- * the next compaction merges into it instead of re-reading placeholders. The tool result the
- * model sees this turn is counts only; its note reaches the next turn through the anchor.
+ * The pass leaves a `<press-trim>` note in the conversation - counts, the files the trimmed run
+ * named, and the caller's note. It is the model's own record of the trim, not a compaction
+ * anchor: `findAnchor` ignores it, so a later `press` summarizes the run on the same terms as any
+ * other work and never treats the note as a merge source. The tool result the model sees this turn
+ * is counts only; its note reaches the next turn through the note message.
  *
  * As with `press`, the tool cannot replace the context itself - only a `context` handler can -
  * so the replacement is staged for the next pass, based on the messages this call processed.
@@ -87,13 +88,13 @@ export function registerTrimTool(pi: ExtensionAPI, state: PressState): void {
 				};
 			}
 
-			// The anchor carries the note, not the tool result: only what is in the conversation
-			// reaches a later compaction, and the model reads its own note back from there.
-			const anchor = renderPressTrim(result.trimmed, extractFilePaths(messages), params.note);
+			// The note carries the caller's message, not the tool result: the tool result is counts
+			// only, and the note reaches the next turn by being part of the conversation.
+			const note = renderPressTrim(result.trimmed, extractFilePaths(messages), params.note);
 
 			// Stage the replacement context for the next context pass; see this function's doc.
 			// The base is the array this call processed, not a re-read of the cache.
-			state.stageCompacted([anchor, ...result.messages], messages);
+			state.stageCompacted([note, ...result.messages], messages);
 
 			return {
 				content: [

@@ -21,6 +21,11 @@ export type ConversationMessage = {
 	content?: unknown;
 	toolName?: string;
 	timestamp?: number;
+	/**
+	 * The body of a `compactionSummary` message, which pi persists and replays in place of the
+	 * messages it replaced. Other roles carry their text in `content`.
+	 */
+	summary?: unknown;
 };
 
 /** The single message a compaction leaves in place of the messages it replaced. */
@@ -67,21 +72,19 @@ export type Compacted = {
 export type CompactionResult = Compacted | { kind: "skipped"; note: string };
 
 /**
- * A compaction already present in the conversation.
+ * A summary already present in the conversation, and where it sits.
  *
- * `text` is the inside of the block - the summary's sections, or a trim note's prose - and
- * `afterIndex` is the anchor message's own index, so `messages.slice(afterIndex + 1)` is
- * exactly the run a fresh compaction covers.
+ * `text` is the inside of the block - the summary's sections - and `afterIndex` is the summary
+ * message's own index, so `messages.slice(afterIndex + 1)` is exactly the run a fresh compaction
+ * covers.
  */
-export type Anchor =
-	| { kind: "summary"; text: string; afterIndex: number }
-	| { kind: "trim"; text: string; afterIndex: number };
+export type Anchor = { kind: "summary"; text: string; afterIndex: number };
 
 /** What a trimming pass produced: replaced tool results, or a reason there was nothing. */
 export type TrimResult =
 	| {
 			kind: "trimmed";
-			/** The rebuilt run: the anchor region untouched, candidate tool results replaced. */
+			/** The rebuilt run, with the candidate tool results replaced. */
 			messages: ConversationMessage[];
 			/** Tool results replaced with the placeholder. */
 			trimmed: number;
@@ -172,44 +175,70 @@ export function buildSnapshot(
 }
 
 /**
- * The last compaction already in the conversation, and where it sits.
+ * The last summary already in the conversation, and where it sits.
  *
  * A compacted conversation carries a summary in place of the messages it replaced, so the next
  * compaction must not re-summarize them: it summarizes what came after and merges it into the
  * summary that is already there. Scanning backward makes the latest anchor win, which is what
  * the conversation's own order means - an older summary was already merged into the newer one.
  *
- * Both anchor kinds are recognized: a `<press-summary>` left by a compaction, and a
- * `<press-trim>` note left by the trimming path. A message that merely mentions a tag - a caller
- * note quoting the format, say - is rejected rather than mistaken for a compaction.
+ * Two shapes count as a summary, because two producers write them. Our own `press` stages an
+ * assistant message holding a `<press-summary>` block. pi's `/compact` persists a
+ * `compactionSummary` message, whose body is whatever summary an extension or pi itself
+ * produced - ours, or pi's own sections. Recognizing both is what keeps `press` from
+ * re-summarizing a conversation that `/compact` already compacted.
+ *
+ * `press-trim` notes are deliberately not anchors. A note is the record of one trim, and what a
+ * later compaction needs from it is only that its tool results are already placeholders - which
+ * it can see in the placeholders themselves. Treating a note as an anchor would make it a
+ * competing merge source, and a note that happened to sit before a summary would swallow it.
+ *
+ * A message that merely mentions the tag - a caller note quoting the format, say - is rejected
+ * rather than mistaken for a compaction: only a body the section parser recognizes is a summary.
  */
 export function findAnchor(messages: readonly ConversationMessage[]): Anchor | undefined {
 	for (let index = messages.length - 1; index >= 0; index -= 1) {
 		const message = messages[index];
-		if (message?.role !== "assistant") continue;
+		if (message === undefined) continue;
+
+		if (message.role === "compactionSummary") {
+			const text = compactionSummaryText(message);
+			if (text.length > 0) return { kind: "summary", text, afterIndex: index };
+			continue;
+		}
+
+		if (message.role !== "assistant") continue;
 
 		const text = textOf(message.content);
 		if (text.length === 0) continue;
 
 		const summary = summaryAnchorText(text);
 		if (summary !== undefined) return { kind: "summary", text: summary, afterIndex: index };
-
-		const trimmed = pressTrimBody(text);
-		if (trimmed !== undefined) return { kind: "trim", text: trimmed, afterIndex: index };
 	}
 	return undefined;
+}
+
+/**
+ * The body of a `compactionSummary` message: our block's inside when it carries one, its text
+ * otherwise.
+ *
+ * A summary pi wrote has its own headings, which our parser does not recognize, so the raw text
+ * is the right answer there. What matters to a later compaction is that a summary exists and
+ * what it says, not who wrote it.
+ */
+function compactionSummaryText(message: ConversationMessage): string {
+	const raw = typeof message.summary === "string" ? message.summary.trim() : "";
+	if (raw.length === 0) return "";
+	return summaryAnchorText(raw) ?? raw;
 }
 
 /** The placeholder an old tool result is replaced with. */
 const TRIMMED_TEXT = "[trimmed]";
 
-/**
- * The shape of a `<press-trim>` anchor's first line: `<n> tool results replaced with [trimmed]`.
- *
- * Written by {@link renderPressTrim} and validated by `pressTrimBody`, so the writer and the
- * parser of the format stay in one file and cannot drift apart.
- */
-const TRIM_COUNT_LINE = /^\d+ tool results replaced with \[trimmed\]/;
+/** Whether a message is a tool result a previous trim already replaced. */
+function isPlaceholder(message: ConversationMessage): boolean {
+	return message.role === "toolResult" && textOf(message.content) === TRIMMED_TEXT;
+}
 
 /**
  * Replace old tool results with a placeholder, keeping every message.
@@ -241,14 +270,12 @@ export function trimMessages(
 	}
 
 	const compacted = messages.slice(0, compactedCount);
-	const anchor = findAnchor(compacted);
-	// At or before the anchor the run has been through this already; only what follows is new
-	// enough to trim.
-	const first = anchor === undefined ? 0 : anchor.afterIndex + 1;
 
 	let trimmed = 0;
-	const rebuilt = compacted.map((message, index) => {
-		if (index < first || message.role !== "toolResult") return message;
+	const rebuilt = compacted.map((message) => {
+		// A result a previous trim already replaced has nothing left to reclaim, and counting it
+		// again would report work that did not happen while the stage added another note.
+		if (message.role !== "toolResult" || isPlaceholder(message)) return message;
 		trimmed += 1;
 		return { ...message, content: [{ type: "text", text: TRIMMED_TEXT }] };
 	});
@@ -266,12 +293,10 @@ export function trimMessages(
 /**
  * The `<press-trim>` message a trim leaves behind.
  *
- * It is the only record of the trim that survives into later turns, so it states what was
- * replaced, which files the trimmed run had been working on - read back out of the tool calls,
- * because a model listing them from memory is how a file goes missing - and the caller's note.
- * The note is appended here, outside anything the model controls, so a note that mattered is
- * not paraphrased away by the next compaction. Its first line is {@link TRIM_COUNT_LINE}'s
- * shape, which is what lets `pressTrimBody` tell a real trim from prose about one.
+ * It is the model's own record of the trim: what was replaced, which files the trimmed run had
+ * been working on - read back out of the tool calls, because a model listing them from memory is
+ * how a file goes missing - and the caller's note. It is not a compaction anchor; `findAnchor`
+ * ignores it, and its only job in a later compaction is to be read as the assistant message it is.
  */
 export function renderPressTrim(
 	trimmed: number,
@@ -339,9 +364,10 @@ export function extractFilePaths(messages: readonly ConversationMessage[]): stri
  * error, unusable answer - raises a {@link PressError} for the caller to report.
  *
  * A conversation that already carries a summary is continued rather than restarted: only the
- * messages after the last {@link findAnchor} anchor are summarized, and the prompt hands the model
+ * messages after the last {@link findAnchor} summary are summarized, and the prompt hands the model
  * its own earlier summary to merge them into. The replacement message still covers the whole
- * compacted run, so the rebuilt context is the same shape either way.
+ * compacted run, so the rebuilt context is the same shape either way. `press-trim` notes are not
+ * anchors and never enter the prompt; the placeholders they left are what says a result is spent.
  */
 export async function compactContext(
 	ctx: CompactionContext,
@@ -513,7 +539,7 @@ function buildPrompt(
 	kept: number,
 	anchor?: Anchor,
 ): string {
-	const anchorBlock = anchor === undefined ? "" : `${anchorIntro(anchor)}\n\n${anchor.text}\n\n`;
+	const anchorBlock = anchor === undefined ? "" : `${anchorIntro()}\n\n${anchor.text}\n\n`;
 	const counts =
 		anchor === undefined
 			? `The ${compacted} messages below are replaced by your answer; the last ${kept} messages are preserved verbatim after it.`
@@ -547,15 +573,10 @@ ${snapshot}`;
 }
 
 /** One sentence telling the model what the block it is about to read is. */
-function anchorIntro(anchor: Anchor): string {
-	if (anchor.kind === "summary") {
-		return `Below is your existing summary for this conversation. Merge the new messages into it: preserve what is still relevant, remove what is superseded or resolved.
+function anchorIntro(): string {
+	return `Below is your existing summary for this conversation. Merge the new messages into it: preserve what is still relevant, remove what is superseded or resolved.
 
 Existing summary:`;
-	}
-	return `The conversation was previously trimmed; the note below describes what was removed. Summarize only the new messages.
-
-Trim note:`;
 }
 
 /**
@@ -623,7 +644,7 @@ export function parsePressSummary(raw: string): PressSummary {
 }
 
 /** The inside of the `<press-summary>` block, or the whole answer when there is no block. */
-function pressSummaryBody(raw: string): string {
+export function pressSummaryBody(raw: string): string {
 	const closed = /<press-summary>([\s\S]*?)<\/press-summary>/i.exec(raw);
 	if (closed?.[1] !== undefined) return closed[1].trim();
 
@@ -644,23 +665,6 @@ function summaryAnchorText(raw: string): string | undefined {
 	if (!/<press-summary>/i.test(raw)) return undefined;
 	const body = pressSummaryBody(raw);
 	return body.split("\n").some((line) => headingKey(line) !== undefined) ? body : undefined;
-}
-
-/**
- * The inside of a `<press-trim>` block, or undefined when the text is not one.
- *
- * The tag alone is not the signal: an assistant turn discussing the trim format would read as
- * a trim just as a note quoting `<press-summary>` would read as a summary. What every real trim
- * opens with is {@link renderPressTrim}'s count line, so the body must start with one - prose
- * about a trim never does. An unclosed tail is still accepted, because a trim message truncated
- * by a token limit still says what was removed.
- */
-function pressTrimBody(raw: string): string | undefined {
-	const closed = /<press-trim>([\s\S]*?)<\/press-trim>/i.exec(raw);
-	const body = closed?.[1] ?? /<press-trim>([\s\S]*)/i.exec(raw)?.[1];
-	if (body === undefined) return undefined;
-	const trimmedBody = body.trim();
-	return TRIM_COUNT_LINE.test(trimmedBody) ? trimmedBody : undefined;
 }
 
 /**

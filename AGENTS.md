@@ -5,9 +5,10 @@ pi-press: a pi extension where the model compacts its own conversation — `pres
 ## Architecture
 
 - `index.ts` — factory. Creates one `PressState` per registration and wires both tools and the hook to it, so sessions never share a conversation.
-- `src/compact.ts` — the compaction engine: snapshot building, trimming, the single model call, and the `<press-summary>`/`<press-trim>` renderers and parsers. Both block formats' writers and parsers live here together — they must not drift.
+- `src/compact.ts` — the compaction engine: snapshot building, trimming, the single model call, and the `<press-summary>`/`<press-trim>` renderers and parsers. Both block formats' writers and parsers live here together — they must not drift. `findAnchor` recognizes summaries only; a trim note is not a merge source.
 - `src/state.ts` — shared state: the cached conversation and the staged compaction.
 - `src/press-tool.ts`, `src/trim-tool.ts` — tool registration and executors.
+- `src/compact-command.ts` — the `session_before_compact` hook, which makes our compaction what a manual `/compact` runs. Only `reason === "manual"`; pi keeps its own threshold and overflow compaction. pi hardcodes `/compact`, so an extension cannot register that command name — this hook is the supported seam, and it is what persists a compaction as a session entry rather than a per-request projection.
 - `src/context-hook.ts` — one pass per LLM call: cache messages, install staged compaction, then threshold checks.
 - `src/config.ts` — the `press` settings key. Read per invocation, never at load, so settings edits stay live mid-session.
 - `src/pi-context-contract.ts` — compile-time drift guard between `CompactionContext` and pi's real context types. Its assignments are the guard.
@@ -22,6 +23,7 @@ pi-press: a pi extension where the model compacts its own conversation — `pres
 - **The cache holds pi's own array.** `hasPrefix` checks prefix membership by reference identity. Copying the array breaks stale-compaction detection.
 - **The engine stays pi-free.** `compact.ts` declares structural message shapes so the smoke-test fake satisfies them; `pi-context-contract.ts` keeps that shape honest against pi's `ExtensionContext` and `ExtensionToolContext`.
 - **Model resolution fails loud.** `press.model` configured but unknown or unauthenticated throws `PressError` with a hint; only an absent `model` falls back to the session model.
+- **`findAnchor` reads two summary shapes.** Our `press` stages an assistant `<press-summary>` block; pi's `/compact` persists a `compactionSummary` message. Both are anchors, or a `press` after a `/compact` would re-summarize compacted work. Trim notes are never anchors.
 
 ## Conventions
 
